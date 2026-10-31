@@ -2179,7 +2179,61 @@ def main() -> int:
         store.save()
     return 0
 
+# ----------------- ЗАПУСК: СУПЕРВИЗОР И ВОРКЕР -----------------
+def run_supervisor():
+    script_path = os.path.abspath(__file__)
+    env = os.environ.copy()
+    env["BOT_WORKER_MODE"] = "1"
+
+    while True:
+        start_ts = time.time()
+        print("[Supervisor] Запуск рабочего процесса бота и веб-панели...")
+        proc = subprocess.Popen([sys.executable, script_path], env=env)
+        exit_code = proc.wait()
+        runtime = time.time() - start_ts
+
+        if exit_code == 42:
+            print("[Supervisor] Сигнал автообновления (42). Перезапуск через 2 сек...")
+            time.sleep(2)
+            continue
+
+        if runtime < 5 and os.path.exists(BACKUP_FILE):
+            print("[Supervisor] Сбой при старте! Откат к резервной копии...")
+            try:
+                shutil.copyfile(BACKUP_FILE, script_path)
+            except Exception:
+                pass
+        time.sleep(3)
+
+
+def run_worker():
+    port = int(os.environ.get("PORT", 10000))
+    # Запускаем Flask в отдельном потоке внутри воркера один раз
+    try:
+        threading.Thread(
+            target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
+
+    threading.Thread(target=giveaway_loop, daemon=True).start()
+    threading.Thread(target=discounts_loop, daemon=True).start()
+    threading.Thread(target=f2p_auto_all_loop, daemon=True).start()
+    threading.Thread(target=keep_alive_pinger, daemon=True).start()
+    threading.Thread(target=notify_if_just_updated, daemon=True).start()
+
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            print(f"[Worker] Ошибка polling: {e}")
+            time.sleep(5)
+
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if os.environ.get("BOT_WORKER_MODE") == "1":
+        run_worker()
+    else:
+        run_supervisor()
 # === КОНЕЦ ФАЙЛА ===
