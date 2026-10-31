@@ -1,20 +1,15 @@
-#!/usr/bin/env python3
-# AniVox Monitor v4.6.0 (Anti-Freeze & Auto-Ping Keep-Alive & Link Inspector & Force Bridge Chat)
-
-from __future__ import annotations
-
 import base64
 import html
 import http
 import io
 import json
-import logging 
+import logging
 import os
 import random
 import re
 import secrets
-import shutil       # <-- проверьте, чтобы был shutil
-import subprocess   # <-- ДОБАВЬТЕ ЭТУ СТРОКУ
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -24,2181 +19,1967 @@ import rsa
 import telebot
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Any, Optional
+# ----------------- ЗАГРУЗКА ТОКЕНА ИЗ TOK.JSON -----------------
+TOK_FILE = "tok.json"
+DEFAULT_RENDER_URL = "https://myhub-yhxu.onrender.com"
 
-APP_NAME = "AniVox Monitor"
-VERSION = "4.6.0"
-CONFIG_PATH = Path(__file__).with_name("anivox_monitor.json")
-LOG_PATH = Path(__file__).with_name("anivox_monitor.log")
-PROFILE_RE = re.compile(
-    r"^https?://(?:www\.)?anivox\.fun/profile/([0-9]+)(?:[/?#].*)?$",
-    re.IGNORECASE,
+
+def load_tok_config():
+    cfg = {
+        "tg_bot_token": os.environ.get("TG_BOT_TOKEN", "ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА"),
+        "render_url": os.environ.get("RENDER_EXTERNAL_URL", DEFAULT_RENDER_URL),
+        "web_password": os.environ.get("WEB_PASSWORD", "admin123"),
+    }
+    if os.path.exists(TOK_FILE):
+        try:
+            with open(TOK_FILE, "r", encoding="utf-8") as f:
+                file_cfg = json.load(f)
+                tok = file_cfg.get("tg_bot_token", "")
+                if tok and "ВСТАВЬТЕ" not in tok:
+                    cfg["tg_bot_token"] = tok
+                if file_cfg.get("render_url"):
+                    cfg["render_url"] = file_cfg["render_url"]
+                if file_cfg.get("web_password"):
+                    cfg["web_password"] = file_cfg["web_password"]
+        except Exception:
+            pass
+    else:
+        try:
+            with open(TOK_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    return cfg
+
+
+tok_config = load_tok_config()
+TG_BOT_TOKEN = tok_config["tg_bot_token"]
+
+SESSION_FILE = "session.json"
+CLAIMED_FILE = "claimed_games.json"
+CLAIMED_F2P_FILE = "claimed_f2p_apps.json"
+BACKUP_FILE = "bot.py.bak"
+
+CHECK_GIVEAWAYS_INTERVAL = 10 * 3600
+CHECK_DISCOUNTS_INTERVAL = 900
+F2P_FARM_INTERVAL = 900
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-ANIME_LINK_RE = re.compile(
-    r"https?://(?:www\.)?(?:anivox\.fun/anime/|shikimori\.(?:one|me)/animes/[a-z]?)([0-9]+)",
-    re.IGNORECASE,
-)
-ALLOWED_INTERVALS = (1, 5, 10, 15, 20, 25, 30)
-DEFAULT_INTERVAL = 10
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 "
-    "Chrome/124.0 Mobile Safari/537.36 AniVoxMonitor/4.6"
-)
 
-logger = logging.getLogger(APP_NAME)
-
-TELEGRAM_KEYBOARD = {
-    "keyboard": [
-        ["📊 Проверить всех", "🌐 Открыть сайт-отчет"],
-        ["🍿 Кто смотрит сейчас", "🏆 Топ активности", "🎲 Случайное аниме"],
-        ["👥 Мои профили", "➕ Добавить", "🗑 Удалить"],
-        ["📈 История", "🎭 Друзья", "📡 Авто-пинг"],
-        ["⚙️ Настройки", "🔕 Уведомления"],
-        ["💬 Связать всех в чат", "🚪 Завершить чат"],
-        ["⏸ Пауза", "▶️ Продолжить"],
-    ],
-    "resize_keyboard": True,
-    "one_time_keyboard": False,
-}
-
-# Глобальное состояние тихого авто-пинга (чтобы сервер не засыпал)
-ping_state: dict[str, Any] = {
+bot_status = {
     "start_time": time.time(),
-    "last_ping_ts": 0.0,
+    "last_ping_ts": 0,
     "last_ping_time": "Еще не выполнялся",
+    "last_ping_url": f"{tok_config['render_url']}/ping",
     "last_ping_code": "—",
     "ping_count": 0,
-    "ping_interval_min": 4,  # 3-5 минут по умолчанию
     "ping_history": [],
+    "ping_interval_min": 4,
+    "last_check": "Еще не выполнялась",
+    "last_discount_check": "Еще не выполнялась",
+    "last_f2p_check": "Еще не выполнялась",
+    "steam_ok": False,
+    "claimed_count": 0,
+    "f2p_added_count": 0,
+    "f2p_auto_all_enabled": False,
+    "f2p_current_page": 0,
+    "autobuy_tasks": set(),
+    "web_msg": "",
 }
 
-
-def almaty_tz() -> timezone:
-    return timezone(timedelta(hours=5), name="ALMT")
-
-
-def almaty_now() -> str:
-    return datetime.now(almaty_tz()).isoformat(timespec="seconds")
-
-
-def compact(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+pending_auth = {}
+calc_state = {}
+library_cache = {}
+update_lock = threading.Lock()
+update_sessions = {}
+UPDATE_TRIGGER_CODES = {"1111", "0000", "обновить", "готово", "ok", "ок", "/apply", "update"}
+web_game_stat_cache = ""
 
 
-def mask_secret(value: str) -> str:
-    return "не задан" if not value else f"{value[:4]}…{value[-4:]}"
+# ----------------- СЕССИЯ И ЛОКАЛЬНЫЕ БАЗЫ -----------------
+def load_session():
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data:
+                    return data
+        except Exception:
+            pass
+    env_b64 = os.environ.get("SESSION_BASE64")
+    if env_b64:
+        try:
+            raw = base64.b64decode(env_b64.strip()).decode("utf-8")
+            data = json.loads(raw)
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return data
+        except Exception:
+            pass
+    return {}
 
 
-def save_json(path: Path, data: dict[str, Any]) -> None:
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+def save_session(data):
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Не удалось прочитать настройки: %s", exc)
-        return {}
+def export_session_b64(data):
+    raw = json.dumps(data, ensure_ascii=False)
+    return base64.b64encode(raw.encode("utf-8")).decode("utf-8")
 
 
-def as_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.lower() in {"1", "true", "yes", "да", "д"}
-    return default
+def load_json_set(filepath):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
 
 
-def normalize_profile_url(value: str) -> tuple[str, str]:
-    candidate = value.strip()
-    if not candidate.startswith(("http://", "https://")):
-        candidate = "https://" + candidate
-    parsed = urllib.parse.urlparse(candidate)
-    normalized = urllib.parse.urlunparse(
-        ("https", parsed.netloc.lower(), parsed.path.rstrip("/"), "", "", "")
-    )
-    match = PROFILE_RE.match(normalized)
-    if not match:
-        raise ValueError("Нужна ссылка вида https://anivox.fun/profile/27788")
-    return normalized, match.group(1)
+def save_json_set(filepath, data_set):
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(list(data_set), f, indent=2, ensure_ascii=False)
 
 
-def parse_bool(value: Any, default: bool = False) -> bool:
-    return as_bool(value, default)
+def strip_html(raw_text):
+    if not raw_text:
+        return ""
+    clean = re.sub(r"<[^>]+>", " ", str(raw_text))
+    return html.unescape(re.sub(r"\s+", " ", clean).strip())
 
 
-def fetch_anime_info(title: str) -> dict[str, Any]:
-    """Запрашивает жанры и ID аниме через открытый API Shikimori (без зависаний)."""
-    if not title or title.lower() in ["неизвестно", "тайтл"]:
-        return {"genres": [], "id": ""}
-    try:
-        time.sleep(1)
-        search_url = f"https://shikimori.one/api/animes?search={urllib.parse.quote(title)}&limit=1"
-        req = urllib.request.Request(search_url, headers={"User-Agent": DEFAULT_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if not data:
-                return {"genres": [], "id": ""}
-            anime_id = str(data[0]["id"])
+# ----------------- КЛИЕНТ STEAM -----------------
+class SteamClient:
+    def __init__(self):
+        self.data = load_session()
+        if "session_id" not in self.data:
+            self.data["session_id"] = secrets.token_hex(12)
+        if "render_url" not in self.data:
+            self.data["render_url"] = tok_config["render_url"]
+        if "watchlist" not in self.data:
+            self.data["watchlist"] = {}
+        if "notes" not in self.data:
+            self.data["notes"] = []
+        if "silent_mode" not in self.data:
+            self.data["silent_mode"] = False
+        if "f2p_auto_all" in self.data:
+            bot_status["f2p_auto_all_enabled"] = bool(self.data["f2p_auto_all"])
 
-        detail_url = f"https://shikimori.one/api/animes/{anime_id}"
-        req2 = urllib.request.Request(detail_url, headers={"User-Agent": DEFAULT_USER_AGENT})
-        with urllib.request.urlopen(req2, timeout=10) as resp2:
-            detail_data = json.loads(resp2.read().decode("utf-8"))
-            genres = [g.get("russian") or g.get("name") for g in detail_data.get("genres", [])]
-            return {"genres": genres, "id": anime_id}
-    except Exception as e:
-        logger.warning(f"Ошибка Shikimori API для '{title}': {e}")
-        return {"genres": [], "id": ""}
+    @property
+    def session_id(self):
+        return self.data["session_id"]
 
+    def is_configured(self):
+        return bool(self.data.get("refresh_token") and self.data.get("steamid"))
 
-def fetch_anime_details_by_id(anime_id: str) -> Optional[dict[str, Any]]:
-    """Загружает подробную карточку аниме по его ID (для работы по ссылкам)."""
-    try:
-        detail_url = f"https://shikimori.one/api/animes/{anime_id}"
-        req = urllib.request.Request(detail_url, headers={"User-Agent": DEFAULT_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            if not isinstance(d, dict) or not d.get("id"):
-                return None
-            genres = [g.get("russian") or g.get("name") for g in d.get("genres", []) if isinstance(g, dict)]
-            return {
-                "id": str(d.get("id")),
-                "name_ru": d.get("russian") or d.get("name") or f"Anime #{anime_id}",
-                "name_en": d.get("name") or "",
-                "score": d.get("score") or "—",
-                "episodes": d.get("episodes") or d.get("episodes_aired") or "?",
-                "status": d.get("status") or "—",
-                "genres": ", ".join(genres) if genres else "Не указаны",
-                "link": f"https://anivox.fun/anime/{d.get('id')}",
-            }
-    except Exception:
+    def atomic_login(self, username, password, guard_code):
+        try:
+            rsa_url = "https://api.steampowered.com/IAuthenticationService/GetPasswordRSAPublicKey/v1/"
+            r = requests.get(rsa_url, params={"account_name": username}, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            resp = r.get("response", {})
+            if not resp.get("publickey_mod"):
+                return {"ok": False, "error": "Не удалось получить RSA-ключ Steam."}
+            mod = int(resp["publickey_mod"], 16)
+            exp = int(resp["publickey_exp"], 16)
+            timestamp = resp["timestamp"]
+            pub_key = rsa.PublicKey(mod, exp)
+            enc_pw = base64.b64encode(rsa.encrypt(password.encode("utf-8"), pub_key)).decode("utf-8")
+
+            begin_url = "https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaCredentials/v1/"
+            b_res = requests.post(begin_url, data={
+                "account_name": username, "encrypted_password": enc_pw, "encryption_timestamp": timestamp,
+                "remember_login": "true", "platform_type": "2", "website_id": "Store", "persistence": "1",
+                "device_friendly_name": "Chrome (Windows)"
+            }, headers={"User-Agent": USER_AGENT}, timeout=15).json().get("response", {})
+            client_id = b_res.get("client_id")
+            request_id = b_res.get("request_id")
+            steamid = b_res.get("steamid")
+            if not client_id or not steamid:
+                return {"ok": False, "error": "Неверный логин или пароль."}
+
+            confs = b_res.get("allowed_confirmations", [])
+            conf_types = [c.get("confirmation_type") for c in confs]
+            code_type = 3 if 3 in conf_types else (2 if 2 in conf_types else 3)
+
+            requests.post("https://api.steampowered.com/IAuthenticationService/UpdateAuthSessionWithSteamGuardCode/v1/", data={
+                "client_id": client_id, "steamid": steamid, "code": guard_code.strip().upper(), "code_type": code_type
+            }, headers={"User-Agent": USER_AGENT}, timeout=15)
+
+            poll_url = "https://api.steampowered.com/IAuthenticationService/PollAuthSessionStatus/v1/"
+            for _ in range(5):
+                p_res = requests.post(poll_url, data={"client_id": client_id, "request_id": request_id}, headers={"User-Agent": USER_AGENT}, timeout=15).json().get("response", {})
+                if p_res.get("refresh_token") and p_res.get("access_token"):
+                    self.data.update({
+                        "steamid": str(steamid), "account_name": username,
+                        "refresh_token": p_res["refresh_token"], "access_token": p_res["access_token"],
+                        "session_id": secrets.token_hex(12),
+                    })
+                    save_session(self.data)
+                    bot_status["steam_ok"] = True
+                    return {"ok": True}
+                time.sleep(1)
+            return {"ok": False, "error": "Код отклонен или IP заблокирован."}
+        except Exception as e:
+            return {"ok": False, "error": f"Ошибка: {e}"}
+
+    def is_token_expired(self):
+        token = self.data.get("access_token", "")
+        if not token:
+            return True
+        try:
+            payload_part = token.split(".")[1]
+            padding = "=" * ((4 - len(payload_part) % 4) % 4)
+            decoded = json.loads(base64.urlsafe_b64decode(payload_part + padding).decode("utf-8"))
+            return time.time() > (decoded.get("exp", 0) - 3600)
+        except Exception:
+            return True
+
+    def refresh_access_token(self):
+        if not self.is_configured():
+            return False
+        url = "https://api.steampowered.com/IAuthenticationService/GenerateAccessTokenForApp/v1/"
+        try:
+            r = requests.post(url, data={"refresh_token": self.data["refresh_token"], "steamid": self.data["steamid"], "renewal_type": 0}, timeout=15).json().get("response", {})
+            if r.get("access_token"):
+                self.data["access_token"] = r["access_token"]
+                save_session(self.data)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def get_cookies(self):
+        if self.is_token_expired():
+            self.refresh_access_token()
+        return {
+            "sessionid": self.session_id,
+            "steamLoginSecure": f"{self.data.get('steamid', '')}%7C%7C{self.data.get('access_token', '')}",
+            "birthtime": "283993201",
+            "lastagecheckage": "1-0-1979",
+        }
+
+    def get_wallet_balance(self):
+        if not self.is_configured():
+            return "Не авторизован"
+        try:
+            r = requests.get("https://store.steampowered.com/account/", cookies=self.get_cookies(), headers={"User-Agent": USER_AGENT}, allow_redirects=False, timeout=15)
+            if r.status_code == 200:
+                bot_status["steam_ok"] = True
+                m = re.search(r'class="accountData price"[^>]*>(.*?)</div>', r.text, re.DOTALL)
+                if not m:
+                    m = re.search(r'id="header_wallet_balance"[^>]*>(.*?)</a>', r.text, re.DOTALL)
+                if m:
+                    return strip_html(m.group(1))
+                return "0 ₸"
+            bot_status["steam_ok"] = False
+        except Exception:
+            bot_status["steam_ok"] = False
+        return "Неизвестно"
+
+    def check_health(self):
+        bal = self.get_wallet_balance()
+        return bot_status["steam_ok"], bal
+
+    def update_profile_field(self, summary=None, persona_name=None, real_name=None):
+        steamid = self.data["steamid"]
+        cookies = self.get_cookies()
+        edit_url = f"https://steamcommunity.com/profiles/{steamid}/edit/info"
+        headers = {"User-Agent": USER_AGENT, "Referer": edit_url}
+        cur_persona = self.data.get("account_name", "Player")
+        cur_real, cur_url, cur_summary = "", "", ""
+        try:
+            info_resp = requests.get(edit_url, cookies=cookies, headers=headers, timeout=15)
+            match = re.search(r'data-profile-edit="([^"]+)"', info_resp.text)
+            if match:
+                p_json = json.loads(html.unescape(match.group(1)))
+                cur_persona = p_json.get("strPersonaName", cur_persona)
+                cur_real = p_json.get("strRealName", "")
+                cur_url = p_json.get("strCustomURL", "")
+                cur_summary = p_json.get("strSummary", "")
+        except Exception:
+            pass
+        payload = {
+            "sessionID": self.session_id, "type": "profileSave",
+            "personaName": persona_name if persona_name is not None else cur_persona,
+            "real_name": real_name if real_name is not None else cur_real,
+            "customURL": cur_url, "summary": summary if summary is not None else cur_summary, "json": "1"
+        }
+        r = requests.post(f"https://steamcommunity.com/profiles/{steamid}/edit/", data=payload, cookies=cookies, headers=headers, timeout=15)
+        return r.status_code == 200
+
+    def get_all_licenses(self):
+        url = "https://store.steampowered.com/account/licenses/?l=russian"
+        try:
+            r = requests.get(url, cookies=self.get_cookies(), headers={"User-Agent": USER_AGENT}, timeout=15)
+            if r.status_code != 200:
+                return []
+            items = []
+            rows = re.findall(r"<tr[^>]*>(.*?)</tr>", r.text, re.DOTALL)
+            for row in rows:
+                tds = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+                if len(tds) < 3:
+                    continue
+                date_str = strip_html(tds[0])
+                acq_method = strip_html(tds[2])
+                m = re.search(r"RemoveFreeLicense\(\s*(\d+)\s*,\s*'([^']*)'", tds[1])
+                removable = bool(m)
+                pkg_id = m.group(1) if m else "0"
+                td_clean = re.sub(r"<div.*?</div>", "", tds[1], flags=re.DOTALL)
+                title = strip_html(td_clean)
+                if not title and m:
+                    try:
+                        title = base64.b64decode(m.group(2)).decode("utf-8").strip()
+                    except Exception:
+                        title = f"Package {pkg_id}"
+                if title:
+                    items.append({"packageid": pkg_id, "name": title[:45], "date": date_str, "method": acq_method, "removable": removable})
+            return items
+        except Exception:
+            return []
+
+    def get_purchase_history(self):
+        url = "https://store.steampowered.com/account/history/?l=russian"
+        try:
+            r = requests.get(url, cookies=self.get_cookies(), headers={"User-Agent": USER_AGENT}, timeout=15)
+            if r.status_code != 200:
+                return []
+            records = []
+            rows = re.findall(r'<tr class="wallet_table_row[^>]*>(.*?)</tr>', r.text, re.DOTALL)
+            for row in rows[:12]:
+                dm = re.search(r'class="wht_date"[^>]*>(.*?)</td>', row, re.DOTALL)
+                im = re.search(r'class="wht_items"[^>]*>(.*?)</td>', row, re.DOTALL)
+                tm = re.search(r'class="wht_total"[^>]*>(.*?)</td>', row, re.DOTALL)
+                date_s = strip_html(dm.group(1)) if dm else "—"
+                item_s = strip_html(im.group(1)) if im else "Операция"
+                total_s = strip_html(tm.group(1)) if tm else "0 ₸"
+                records.append(f"📅 `{date_s}` — **{item_s[:38]}** (`{total_s}`)")
+            return records
+        except Exception:
+            return []
+
+    def redeem_cd_key(self, key_str):
+        url = "https://store.steampowered.com/account/ajaxregisterkey/"
+        headers = {"User-Agent": USER_AGENT, "Referer": "https://store.steampowered.com/account/registerkey", "X-Requested-With": "XMLHttpRequest"}
+        try:
+            r = requests.post(url, data={"product_key": key_str.strip(), "sessionid": self.session_id}, cookies=self.get_cookies(), headers=headers, timeout=15).json()
+            success = r.get("success") == 1
+            receipt = r.get("purchase_receipt_info", {})
+            items = receipt.get("line_items", [])
+            game_names = ", ".join([i.get("line_item_description", "Игра") for i in items])
+            return {"ok": success, "games": game_names, "raw": r}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def remove_license(self, package_id):
+        url = "https://store.steampowered.com/account/removelicense"
+        headers = {"User-Agent": USER_AGENT, "Referer": "https://store.steampowered.com/account/licenses/", "X-Requested-With": "XMLHttpRequest"}
+        try:
+            r = requests.post(url, data={"sessionid": self.session_id, "packageid": str(package_id)}, cookies=self.get_cookies(), headers=headers, timeout=15)
+            return r.status_code == 200 and r.json().get("success") == 1
+        except Exception:
+            return False
+
+    def get_subid_from_appid(self, app_id):
+        try:
+            page = requests.get(f"https://store.steampowered.com/app/{app_id}/", cookies=self.get_cookies(), headers={"User-Agent": USER_AGENT}, timeout=15).text
+            match = re.search(r"addFreeLicense\(\s*(\d+)", page)
+            if match:
+                return match.group(1)
+            sub_match = re.search(r'name="subid"\s+value="(\d+)"', page)
+            if sub_match:
+                return sub_match.group(1)
+        except Exception:
+            pass
+        try:
+            api_url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&cc=kz&l=ru"
+            data = requests.get(api_url, timeout=15).json().get(str(app_id), {})
+            if data.get("success"):
+                packages = data.get("data", {}).get("packages", [])
+                if packages:
+                    return str(packages[0])
+        except Exception:
+            pass
         return None
 
+    def add_free_license(self, sub_id):
+        cookies = self.get_cookies()
+        headers = {"User-Agent": USER_AGENT, "Referer": "https://store.steampowered.com/", "X-Requested-With": "XMLHttpRequest"}
+        u1 = f"https://store.steampowered.com/freelicense/addfreelicense/{sub_id}"
+        r1 = requests.post(u1, data={"sessionid": self.session_id, "ajax": "true"}, cookies=cookies, headers=headers, timeout=15)
+        u2 = "https://store.steampowered.com/checkout/addfreelicense"
+        r2 = requests.post(u2, data={"action": "add_to_cart", "sessionid": self.session_id, "subid": str(sub_id)}, cookies=cookies, headers=headers, timeout=15)
+        return r1.status_code == 200 or r2.status_code == 200
 
-def fetch_random_top_anime() -> Optional[dict[str, Any]]:
-    """Находит случайное популярное аниме с высоким рейтингом."""
+    def fetch_f2p_catalog_page(self, start_offset=0, count=50):
+        url = "https://store.steampowered.com/search/results/"
+        params = {"query": "", "start": start_offset, "count": count, "maxprice": "free", "category1": "998", "infinite": "1", "cc": "kz", "l": "russian"}
+        try:
+            r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            html_block = r.get("results_html", "")
+            matches = re.findall(r'data-ds-appid="(\d+)".*?<span class="title">(.*?)</span>', html_block, re.DOTALL)
+            return [{"appid": appid.strip(), "name": html.unescape(title.strip())} for appid, title in matches]
+        except Exception:
+            return []
+
+    def add_random_f2p_batch(self, target_count=5, sequential=False):
+        claimed_f2p = load_json_set(CLAIMED_F2P_FILE)
+        if sequential:
+            offset = (bot_status["f2p_current_page"] * 50) % 2500
+            bot_status["f2p_current_page"] += 1
+        else:
+            offset = random.choice([0, 50, 100, 150, 200, 300, 400, 500, 700, 900, 1200])
+        candidates = self.fetch_f2p_catalog_page(start_offset=offset, count=50)
+        if not candidates:
+            candidates = self.fetch_f2p_catalog_page(start_offset=0, count=50)
+        if not sequential:
+            random.shuffle(candidates)
+        added_games = []
+        for game in candidates:
+            if len(added_games) >= target_count:
+                break
+            appid = game["appid"]
+            if appid in claimed_f2p:
+                continue
+            sub_id = self.get_subid_from_appid(appid)
+            if sub_id and self.add_free_license(sub_id):
+                claimed_f2p.add(appid)
+                added_games.append(f"• **{game['name']}** (`{appid}`)")
+                bot_status["f2p_added_count"] += 1
+                bot_status["claimed_count"] += 1
+                time.sleep(1.5)
+        save_json_set(CLAIMED_F2P_FILE, claimed_f2p)
+        return added_games
+
+    def get_live_player_count(self, app_id):
+        url = f"https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={app_id}"
+        try:
+            r = requests.get(url, timeout=10).json()
+            if r.get("response", {}).get("result") == 1:
+                return r["response"].get("player_count", 0)
+        except Exception:
+            pass
+        return None
+
+    def get_game_news(self, app_id, count=3):
+        url = f"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid={app_id}&count={count}&maxlength=250"
+        try:
+            r = requests.get(url, timeout=10).json()
+            items = r.get("appnews", {}).get("newsitems", [])
+            out = []
+            for it in items:
+                dt = time.strftime("%d.%m.%Y", time.localtime(it.get("date", time.time())))
+                out.append(f"📰 `{dt}` — **{it.get('title', 'Новость')}**\n🔗 {it.get('url', '')}")
+            return out
+        except Exception:
+            return []
+
+    def compare_regional_prices(self, app_id):
+        regions = [("🇰🇿 Казахстан", "kz"), ("🇺🇸 США", "us"), ("🇺🇦 Украина", "ua"), ("🇷🇺 Россия", "ru")]
+        results = []
+        game_name = f"App {app_id}"
+        for label, cc in regions:
+            try:
+                url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&cc={cc}&l=ru"
+                r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10).json()
+                app_d = r.get(str(app_id), {})
+                if app_d.get("success"):
+                    data = app_d.get("data", {})
+                    game_name = data.get("name", game_name)
+                    if data.get("is_free"):
+                        results.append(f"{label}: `Бесплатно`")
+                        continue
+                    po = data.get("price_overview", {})
+                    if po:
+                        fin = po.get("final_formatted", "Н/Д")
+                        disc = po.get("discount_percent", 0)
+                        d_str = f" (-{disc}%)" if disc > 0 else ""
+                        results.append(f"{label}: **`{fin}`**{d_str}")
+                    else:
+                        results.append(f"{label}: `Недоступно`")
+            except Exception:
+                results.append(f"{label}: `Ошибка`")
+        return game_name, results
+
+    def add_free_dlcs_for_game(self, app_id):
+        url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&cc=kz&l=ru"
+        added_dlcs = []
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            data = r.get(str(app_id), {}).get("data", {})
+            for dlc_id in data.get("dlc", [])[:15]:
+                info = self.get_game_price_info(dlc_id)
+                if info and info.get("is_free"):
+                    sub_id = info.get("subid") or self.get_subid_from_appid(dlc_id)
+                    if sub_id and self.add_free_license(sub_id):
+                        added_dlcs.append(f"• {info['name']} (`{dlc_id}`)")
+                        time.sleep(1.2)
+        except Exception:
+            pass
+        return added_dlcs
+
+    def get_global_achievements(self, app_id):
+        url = f"https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid={app_id}"
+        try:
+            r = requests.get(url, timeout=10).json()
+            achs = r.get("achievementpercentages", {}).get("achievements", [])
+            if not achs:
+                return None
+            achs_sorted = sorted(achs, key=lambda x: float(x.get("percent", 0)), reverse=True)
+            return {"total": len(achs), "easiest": achs_sorted[:4], "rarest": achs_sorted[-4:]}
+        except Exception:
+            return None
+
+    def get_wishlist_items(self):
+        steamid = self.data.get("steamid")
+        if not steamid:
+            return []
+        url = f"https://store.steampowered.com/wishlist/profiles/{steamid}/wishlistdata/?p=0&cc=kz&l=russian"
+        try:
+            r = requests.get(url, cookies=self.get_cookies(), headers={"User-Agent": USER_AGENT}, timeout=15)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            if not isinstance(data, dict):
+                return []
+            items = []
+            for appid, info in list(data.items())[:15]:
+                if not str(appid).isdigit():
+                    continue
+                name = info.get("name", f"App {appid}")
+                subs = info.get("subs", [])
+                disc = subs[0].get("discount_pct", 0) or 0 if subs else 0
+                raw_p = subs[0].get("price", 0) if subs else 0
+                price_txt = f"{int(raw_p)/100:g} ₸" if raw_p else "Без цены"
+                items.append({"appid": str(appid), "name": html.unescape(name), "discount": disc, "price": price_txt})
+            return items
+        except Exception:
+            return []
+
+    def clear_steam_cart(self):
+        cookies = self.get_cookies()
+        cookies["shoppingCartGID"] = "-1"
+        try:
+            r = requests.post("https://store.steampowered.com/cart/", data={"action": "remove_all", "sessionid": self.session_id}, cookies=cookies, headers={"User-Agent": USER_AGENT}, timeout=15)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def get_top_sellers_kz(self):
+        url = "https://store.steampowered.com/api/featuredcategories?cc=kz&l=ru"
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            tops = r.get("top_sellers", {}).get("items", [])[:8]
+            out = []
+            for t in tops:
+                final_kzt = t.get("final_price", 0) / 100.0
+                out.append({"appid": str(t.get("id")), "name": t.get("name", "Игра"), "discount": t.get("discount_percent", 0), "price": f"{final_kzt:g} ₸" if final_kzt > 0 else "Бесплатно"})
+            return out
+        except Exception:
+            return []
+
+    def inspect_package_subid(self, sub_id):
+        url = f"https://store.steampowered.com/api/packagedetails?packageids={sub_id}&cc=kz&l=ru"
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            pkg = r.get(str(sub_id), {})
+            if not pkg.get("success"):
+                return None
+            data = pkg.get("data", {})
+            price = data.get("price", {})
+            final_kzt = price.get("final", 0) / 100.0 if price else 0
+            return {"subid": str(sub_id), "name": data.get("name", f"Package {sub_id}"), "apps": [a.get("name", "") for a in data.get("apps", [])], "price_kzt": f"{final_kzt:g} ₸" if final_kzt > 0 else "Бесплатно / 0 ₸"}
+        except Exception:
+            return None
+
+    def get_game_price_info(self, app_id):
+        url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&cc=kz&l=ru"
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            app_data = r.get(str(app_id), {})
+            if not app_data.get("success"):
+                return None
+            data = app_data.get("data", {})
+            name = data.get("name", f"App {app_id}")
+            is_free = data.get("is_free", False)
+            price_ov = data.get("price_overview", {})
+            packages = data.get("packages", [])
+            sub_id = str(packages[0]) if packages else None
+            pc_req = data.get("pc_requirements", {})
+            base_info = {
+                "appid": str(app_id),
+                "subid": sub_id,
+                "name": name,
+                "genres": ", ".join([g.get("description", "") for g in data.get("genres", [])[:3]]) or "Игры",
+                "pc_min": strip_html(pc_req.get("minimum", "Не указаны"))[:350],
+                "pc_rec": strip_html(pc_req.get("recommended", "Не указаны"))[:350],
+                "metacritic": data.get("metacritic", {}).get("score", "Н/Д"),
+                "recommendations": data.get("recommendations", {}).get("total", 0),
+            }
+            if is_free:
+                base_info.update({"is_free": True, "discount": 100, "initial_kzt": 0.0, "final_kzt": 0.0, "final_formatted": "Бесплатно (0 ₸)", "initial_formatted": "0 ₸"})
+                return base_info
+            if not price_ov:
+                base_info.update({"is_free": False, "discount": 0, "initial_kzt": 0.0, "final_kzt": 0.0, "final_formatted": "Недоступно", "initial_formatted": "—"})
+                return base_info
+            initial_kzt = price_ov.get("initial", 0) / 100.0
+            final_kzt = price_ov.get("final", 0) / 100.0
+            base_info.update({
+                "is_free": False,
+                "discount": int(price_ov.get("discount_percent", 0)),
+                "initial_kzt": initial_kzt,
+                "final_kzt": final_kzt,
+                "final_formatted": price_ov.get("final_formatted", f"{final_kzt:g} ₸"),
+                "initial_formatted": price_ov.get("initial_formatted", f"{initial_kzt:g} ₸"),
+            })
+            return base_info
+        except Exception:
+            return None
+
+    def search_games_by_name(self, query):
+        url = "https://store.steampowered.com/api/storesearch/"
+        try:
+            r = requests.get(url, params={"term": query, "l": "russian", "cc": "kz"}, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            results = []
+            for it in r.get("items", [])[:6]:
+                price_info = it.get("price", {})
+                if price_info:
+                    final_kzt = price_info.get("final", 0) / 100.0
+                    disc = price_info.get("discount_percent", 0)
+                    price_str = f"{final_kzt:g} ₸" + (f" (-{disc}%)" if disc > 0 else "")
+                else:
+                    price_str = "Бесплатно / Н/Д"
+                results.append({"appid": str(it.get("id")), "name": it.get("name", "Игра"), "price_str": price_str})
+            return results
+        except Exception:
+            return []
+
+    def get_top_daily_specials(self):
+        url = "https://store.steampowered.com/api/featuredcategories?cc=kz&l=ru"
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15).json()
+            out = []
+            for sp in r.get("specials", {}).get("items", [])[:8]:
+                final_kzt = sp.get("final_price", 0) / 100.0
+                init_kzt = sp.get("original_price", 0) / 100.0
+                out.append({"appid": str(sp.get("id")), "name": sp.get("name", "Игра"), "discount": sp.get("discount_percent", 0), "final_kzt": f"{final_kzt:g} ₸", "init_kzt": f"{init_kzt:g} ₸"})
+            return out
+        except Exception:
+            return []
+
+    def auto_purchase_game(self, app_id, sub_id=None):
+        if not sub_id:
+            sub_id = self.get_subid_from_appid(app_id)
+        if not sub_id:
+            return {"ok": False, "msg": "Не найден пакет (SubID) для покупки."}
+        self.add_free_license(sub_id)
+        cookies = self.get_cookies()
+        headers = {"User-Agent": USER_AGENT, "Referer": f"https://store.steampowered.com/app/{app_id}/", "X-Requested-With": "XMLHttpRequest"}
+        try:
+            requests.post("https://store.steampowered.com/cart/", data={"action": "add_to_cart", "sessionid": self.session_id, "subid": str(sub_id)}, cookies=cookies, headers=headers, timeout=15)
+            init_res = requests.post("https://store.steampowered.com/checkout/inittransaction/", data={"gidShoppingCart": -1, "sessionid": self.session_id, "PaymentMethod": "steamaccount", "bUseAccountCart": 1, "Country": "KZ"}, cookies=cookies, headers=headers, timeout=15).json()
+            transid = init_res.get("transid")
+            if transid:
+                fin_res = requests.post("https://store.steampowered.com/checkout/finalizetransaction/", data={"transid": transid, "CardCVV2": ""}, cookies=cookies, headers=headers, timeout=15).json()
+                if fin_res.get("success") == 22 or fin_res.get("bSuccess"):
+                    return {"ok": True, "msg": "✅ Игра автоматически оплачена с баланса кошелька Steam и добавлена в библиотеку!"}
+            return {"ok": True, "msg": "🛒 Игра добавлена в вашу корзину Steam! Подтвердите списание с кошелька."}
+        except Exception as e:
+            return {"ok": False, "msg": f"Ошибка автопокупки: {e}"}
+
+
+steam = SteamClient()
+bot = telebot.TeleBot(TG_BOT_TOKEN)
+
+
+def is_admin(user_id):
+    saved_admin = steam.data.get("admin_id")
+    if not saved_admin:
+        steam.data["admin_id"] = user_id
+        save_session(steam.data)
+        return True
+    return int(saved_admin) == int(user_id)
+
+
+def notify_user(chat_id, text, reply_markup=None):
+    if not chat_id:
+        return
     try:
-        page = random.randint(1, 15)
-        url = f"https://shikimori.one/api/animes?limit=20&order=popularity&page={page}&score=7"
-        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            items = json.loads(resp.read().decode("utf-8"))
-            if isinstance(items, list) and items:
-                pick = random.choice(items)
-                return fetch_anime_details_by_id(str(pick.get("id")))
+        bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup, disable_notification=steam.data.get("silent_mode", False), disable_web_page_preview=True)
     except Exception:
         pass
-    return None
 
 
-def background_fetch_info(title: str, anime_cache: dict, store_path: Path) -> None:
-    """Фоновая функция для поиска жанров и ID без лагов бота."""
-    if title in anime_cache and isinstance(anime_cache[title], dict) and anime_cache[title].get("id"):
-        return
-
-    info = fetch_anime_info(title)
-    anime_cache[title] = info
-    raw = load_json(store_path)
-    raw["anime_cache"] = anime_cache
-    save_json(store_path, raw)
-
-
-def get_anime_data(title: str, cache: dict) -> tuple[str, str]:
-    """Возвращает (строка_жанров, прямая_ссылка_anivox_через_id)"""
-    cached = cache.get(title)
-    genres_str = "-"
-    link = "https://anivox.fun"
-
-    if isinstance(cached, dict):
-        genres_str = ", ".join(cached.get("genres", [])) or "-"
-        if cached.get("id"):
-            link = f"https://anivox.fun/anime/{cached['id']}"
-    elif isinstance(cached, list):
-        genres_str = ", ".join(cached) or "-"
-
-    return genres_str, link
-
-
-@dataclass
-class Profile:
-    url: str
-    profile_id: str
-    label: str = ""
-    last_signature: str = ""
-    last_check: str = ""
-    last_ok: bool = False
-    last_error: str = ""
-    last_status: str = ""
-
-
-@dataclass
-class Settings:
-    interval_minutes: int = DEFAULT_INTERVAL
-    auto_cleanup_days: int = 15
-    notify_on_change: bool = True
-    notify_on_online: bool = True
-    notify_on_offline: bool = True
-    notify_on_title: bool = True
-    notify_on_errors: bool = False
-    request_timeout: int = 20
-    min_request_gap_seconds: int = 5
-
-
-class Store:
-    def __init__(self, path: Path) -> None:
-        raw = load_json(path)
-        self.path = path
-        self.token = str(raw.get("token") or os.environ.get("TG_BOT_TOKEN", "")).strip()
-        self.chat_id = str(raw.get("chat_id") or os.environ.get("CHAT_ID", "")).strip()
-        self.ping_url = str(
-            raw.get("ping_url")
-            or os.environ.get("RENDER_EXTERNAL_URL")
-            or "http://78.154.103.11:15887"
-        ).strip()
-
-        self.allowed_users: list[str] = raw.get("allowed_users", [])
-        if self.chat_id and self.chat_id not in self.allowed_users:
-            self.allowed_users.append(self.chat_id)
-
-        self.anime_cache: dict[str, Any] = raw.get("anime_cache", {})
-
-        raw_settings = raw.get("settings", {})
-        raw_settings = raw_settings if isinstance(raw_settings, dict) else {}
-        interval = int(raw_settings.get("interval_minutes", DEFAULT_INTERVAL))
-        if interval not in ALLOWED_INTERVALS:
-            interval = DEFAULT_INTERVAL
-
-        self.settings = Settings(
-            interval_minutes=interval,
-            auto_cleanup_days=int(raw_settings.get("auto_cleanup_days", 15)),
-            notify_on_change=as_bool(raw_settings.get("notify_on_change"), True),
-            notify_on_online=as_bool(raw_settings.get("notify_on_online"), True),
-            notify_on_offline=as_bool(raw_settings.get("notify_on_offline"), True),
-            notify_on_title=as_bool(raw_settings.get("notify_on_title"), True),
-            notify_on_errors=as_bool(raw_settings.get("notify_on_errors"), False),
-            request_timeout=max(5, min(90, int(raw_settings.get("request_timeout", 20)))),
-            min_request_gap_seconds=max(
-                1, min(300, int(raw_settings.get("min_request_gap_seconds", 5)))
-            ),
+# ----------------- ГЛАВНОЕ МЕНЮ TELEGRAM -----------------
+def get_main_keyboard():
+    kb = InlineKeyboardMarkup(row_width=2)
+    if not steam.is_configured():
+        kb.add(InlineKeyboardButton("🔑 Войти в Steam", callback_data="login_steam"), InlineKeyboardButton("📥 Вставить сессию", callback_data="import_b64"))
+        kb.add(InlineKeyboardButton("📡 Статус и Пинг", callback_data="menu_ping"), InlineKeyboardButton("🔄 Обновить бота", callback_data="update_bot"))
+    else:
+        f2p_state = "🟢 ВКЛ" if bot_status["f2p_auto_all_enabled"] else "⚪"
+        kb.add(
+            InlineKeyboardButton("📚 Вся библиотека", callback_data="menu_library"),
+            InlineKeyboardButton(f"🎮 Фарм F2P (Рандом/Все) {f2p_state}", callback_data="menu_f2p_farm"),
+            InlineKeyboardButton("🧮 Калькулятор и Автобай", callback_data="menu_calc"),
+            InlineKeyboardButton("📉 Радар скидок", callback_data="menu_discounts"),
+            InlineKeyboardButton("🔎 Поиск игры в Steam", callback_data="menu_search"),
+            InlineKeyboardButton("🔥 Скидки и Топ чарта (₸)", callback_data="menu_specials"),
+            InlineKeyboardButton("🛠 20+ Инструментов Steam", callback_data="menu_tools"),
+            InlineKeyboardButton("🎁 Автосбор 100% раздач", callback_data="menu_giveaways"),
+            InlineKeyboardButton("👤 Профиль и Баланс", callback_data="menu_profile"),
+            InlineKeyboardButton("📡 Тихий пинг", callback_data="menu_ping"),
+            InlineKeyboardButton("🔄 Система / Автообновление", callback_data="menu_system"),
         )
+    return kb
 
-        self.profiles: dict[str, Profile] = {}
-        raw_profiles = raw.get("profiles", [])
-        if isinstance(raw_profiles, list):
-            for item in raw_profiles:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    profile = Profile(
-                        url=str(item["url"]),
-                        profile_id=str(item["profile_id"]),
-                        label=str(item.get("label", "")),
-                        last_signature=str(item.get("last_signature", "")),
-                        last_check=str(item.get("last_check", "")),
-                        last_ok=as_bool(item.get("last_ok"), False),
-                        last_error=str(item.get("last_error", "")),
-                        last_status=str(item.get("last_status", "")),
-                    )
-                except (KeyError, TypeError):
-                    continue
-                self.profiles[profile.profile_id] = profile
 
-        self.history: dict[str, list[dict[str, Any]]] = {}
-        raw_history = raw.get("history", {})
-        if isinstance(raw_history, dict):
-            for profile_id, entries in raw_history.items():
-                if isinstance(entries, list):
-                    cleaned_entries = []
-                    for item in entries:
-                        if not isinstance(item, dict):
-                            continue
-                        if not cleaned_entries:
-                            cleaned_entries.append(item)
-                        else:
-                            last_item = cleaned_entries[-1]
-                            if (
-                                last_item.get("presence") != item.get("presence")
-                                or last_item.get("nickname") != item.get("nickname")
-                                or last_item.get("level") != item.get("level")
-                                or last_item.get("title") != item.get("title")
-                            ):
-                                cleaned_entries.append(item)
-                    self.history[str(profile_id)] = cleaned_entries[-500:]
+def format_dashboard_text():
+    if not steam.is_configured():
+        return f"👋 **Добро пожаловать в Steam Ultimate Bot!**\n\n📄 Токен загружен из `tok.json`.\n🌐 Сайт управления: `{tok_config['render_url']}`\nАвторизуйтесь в аккаунте Steam:"
+    ago = f"{int(time.time() - bot_status['last_ping_ts'])} сек. назад" if bot_status["last_ping_ts"] > 0 else "Ожидание..."
+    watchlist_count = len(steam.data.get("watchlist", {}))
+    f2p_farm_str = "🟢 Активен (каждые 15 мин)" if bot_status["f2p_auto_all_enabled"] else "⏸ Выключен"
+    upd_ver = steam.data.get("last_update_time", "Актуальная сборка")
+    return (
+        f"🤖 **Панель управления Steam Ultimate**\n\n"
+        f"👤 Аккаунт: `{steam.data.get('account_name')}`\n"
+        f"🏷 Версия: `{upd_ver}`\n"
+        f"🎮 Авто-фарм всех F2P: `{f2p_farm_str}` (Добавлено: `{bot_status['f2p_added_count']}`)\n"
+        f"📉 Игр на радаре / автопокупке: `{watchlist_count}`\n"
+        f"🎁 Забрано раздач за сеанс: `{bot_status['claimed_count']}`\n"
+        f"📡 Последний тихий пинг: `{ago}`\n"
+        f"🌐 Веб-панель: [Открыть сайт управления]({steam.data.get('render_url')})\n\n"
+        f"👇 Выберите нужный раздел:"
+    )
 
-    def save(self) -> None:
-        save_json(
-            self.path,
-            {
-                "token": self.token,
-                "chat_id": self.chat_id,
-                "ping_url": self.ping_url,
-                "allowed_users": self.allowed_users,
-                "anime_cache": self.anime_cache,
-                "settings": asdict(self.settings),
-                "profiles": [asdict(p) for p in self.profiles.values()],
-                "history": self.history,
-            },
-        )
 
-    def add_history(
-        self,
-        profile_id: str,
-        result: "FetchResult",
-        changes: list[str],
-    ) -> None:
-        if not result.ok or not changes:
+def send_or_edit(chat_id, text, reply_markup, message_id=None):
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
             return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
 
-        entries = self.history.setdefault(profile_id, [])
-        if entries:
-            last_entry = entries[-1]
-            if (
-                last_entry.get("presence") == result.presence
-                and last_entry.get("nickname") == result.nickname
-                and last_entry.get("level") == result.level
-                and last_entry.get("title") == result.title
-            ):
+
+# ----------------- ДВИЖОК АВТООБНОВЛЕНИЯ -----------------
+def get_sorted_buffer_code(chat_id):
+    sess = update_sessions.get(chat_id)
+    if not sess or not sess.get("chunks"):
+        return ""
+    sorted_chunks = [txt for _, txt in sorted(sess["chunks"], key=lambda item: item[0])]
+    return "\n".join(sorted_chunks)
+
+
+def apply_new_bot_code(chat_id, new_code):
+    new_code = new_code.strip()
+    new_code = re.sub(r"^```[a-zA-Z]*\n", "", new_code)
+    new_code = re.sub(r"\n```$", "", new_code)
+    if len(new_code) < 100:
+        if chat_id:
+            notify_user(chat_id, "❌ Код пустой или слишком короткий.", get_main_keyboard())
+        return False, "Код слишком короткий"
+    if "ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА" in new_code:
+        new_code = new_code.replace("ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА", TG_BOT_TOKEN)
+    script_path = os.path.abspath(__file__)
+    script_name = os.path.basename(script_path)
+    try:
+        compile(new_code, script_name, "exec")
+    except SyntaxError as e:
+        err_text = f"Ошибка синтаксиса в строке {e.lineno}: {e.msg}"
+        if chat_id:
+            notify_user(chat_id, f"❌ **{err_text}**\nСтарый бот продолжает работать без сбоев!", get_main_keyboard())
+        return False, err_text
+    try:
+        if os.path.exists(script_path):
+            shutil.copyfile(script_path, BACKUP_FILE)
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(new_code)
+    except Exception as e:
+        return False, str(e)
+    upd_time = time.strftime("%d.%m %H:%M:%S")
+    steam.data["last_update_time"] = f"Обновлен {upd_time}"
+    steam.data["just_updated"] = upd_time
+    save_session(steam.data)
+    if chat_id:
+        update_sessions.pop(chat_id, None)
+        notify_user(chat_id, f"✅ **Код проверен и сохранен в `{script_name}` (`{len(new_code)}` симв.)!**\n🔄 Перезапускаю бота...")
+
+    def _graceful_restart():
+        time.sleep(1.0)
+        try:
+            bot.stop_polling()
+        except Exception:
+            pass
+        time.sleep(1.0)
+        if os.environ.get("BOT_WORKER_MODE") == "1":
+            os._exit(42)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_graceful_restart, daemon=True).start()
+    return True, "Успешно обновлено!"
+
+
+@bot.message_handler(content_types=["document"])
+def handle_document_update(message):
+    if not is_admin(message.from_user.id):
+        return
+    doc = message.document
+    fname = (doc.file_name or "").lower()
+    if fname.endswith(".py") or fname.endswith(".txt") or update_sessions.get(message.chat.id, {}).get("active"):
+        bot.send_message(message.chat.id, f"📥 Скачиваю файл `{doc.file_name}` и проверяю код...", parse_mode="Markdown")
+        try:
+            file_info = bot.get_file(doc.file_id)
+            file_url = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{file_info.file_path}"
+            resp = requests.get(file_url, timeout=30)
+            if resp.status_code == 200:
+                apply_new_bot_code(message.chat.id, resp.content.decode("utf-8-sig", errors="replace"))
+        except Exception as e:
+            notify_user(message.chat.id, f"❌ Ошибка чтения файла: {e}", get_main_keyboard())
+
+
+@bot.message_handler(func=lambda m: update_sessions.get(m.chat.id, {}).get("active", False), content_types=["text"])
+def handle_chunked_update_text(message):
+    chat_id = message.chat.id
+    text_stripped = message.text.strip()
+    low = text_stripped.lower()
+    if low in ("отмена", "/cancel", "cancel"):
+        update_sessions.pop(chat_id, None)
+        notify_user(chat_id, "❎ Режим автообновления отменен.", get_main_keyboard())
+        return
+    if low in UPDATE_TRIGGER_CODES:
+        with update_lock:
+            full_code = get_sorted_buffer_code(chat_id)
+            parts_cnt = len(update_sessions.get(chat_id, {}).get("chunks", []))
+        if not full_code:
+            notify_user(chat_id, "⚠️ Буфер пуст! Сначала отправьте код.")
+            return
+        bot.send_message(chat_id, f"🔑 Объединяю `{parts_cnt}` частей и обновляю...", parse_mode="Markdown")
+        apply_new_bot_code(chat_id, full_code)
+        return
+    if (text_stripped.startswith("http://") or text_stripped.startswith("https://")) and "\n" not in text_stripped:
+        try:
+            r = requests.get(text_stripped, headers={"User-Agent": USER_AGENT}, timeout=15)
+            if r.status_code == 200:
+                apply_new_bot_code(chat_id, r.text)
                 return
+        except Exception as e:
+            notify_user(chat_id, f"❌ Ошибка скачивания: {e}")
+            return
+    with update_lock:
+        sess = update_sessions[chat_id]
+        sess["chunks"].append((message.message_id, message.text))
+        full_code = get_sorted_buffer_code(chat_id)
+        total_chars = len(full_code)
+        parts_count = len(sess["chunks"])
+    is_valid = False
+    try:
+        clean_test = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", full_code.strip())
+        compile(clean_test, "main.py", "exec")
+        is_valid = True
+    except SyntaxError:
+        pass
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton(f"✅ Объединить и обновить ({parts_count} ч., {total_chars} симв.)", callback_data="upd_apply_now"),
+        InlineKeyboardButton("🧹 Очистить буфер", callback_data="upd_clear_buf"),
+        InlineKeyboardButton("❌ Отмена", callback_data="upd_cancel"),
+    )
+    st = "🟢 **Код валиден! Отправьте `1111` или нажмите кнопку ниже:**" if is_valid else "🟡 *Принимаю части... Когда отправите все, напишите `1111`:*"
+    msg_text = f"📥 **Буфер автообновления:** `{parts_count} ч.` (`{total_chars}` симв.)\n\n{st}"
+    with update_lock:
+        status_mid = sess.get("status_msg_id")
+        if status_mid:
+            try:
+                bot.edit_message_text(msg_text, chat_id, status_mid, parse_mode="Markdown", reply_markup=kb)
+                return
+            except Exception:
+                pass
+        sent = bot.send_message(chat_id, msg_text, parse_mode="Markdown", reply_markup=kb)
+        sess["status_msg_id"] = sent.message_id
 
-        if result.title:
-            cached = self.anime_cache.get(result.title)
-            if (
-                not cached
-                or (isinstance(cached, dict) and not cached.get("id"))
-                or isinstance(cached, list)
-            ):
-                if not isinstance(cached, dict):
-                    self.anime_cache[result.title] = {"genres": [], "id": ""}
-                threading.Thread(
-                    target=background_fetch_info,
-                    args=(result.title, self.anime_cache, self.path),
-                    daemon=True,
-                ).start()
 
-        entries.append(
-            {
-                "checked_at": result.checked_at,
-                "ok": result.ok,
-                "nickname": result.nickname,
-                "level": result.level,
-                "presence": result.presence,
-                "title": result.title,
-                "signature": result.signature,
-                "changes": changes,
-                "error": result.error,
-            }
+# ----------------- КОМАНДЫ И КОЛБЭКИ TELEGRAM -----------------
+@bot.message_handler(commands=["start", "menu"])
+def cmd_start(message):
+    if not is_admin(message.from_user.id):
+        return
+    update_sessions.pop(message.chat.id, None)
+    send_or_edit(message.chat.id, format_dashboard_text(), get_main_keyboard())
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    if not is_admin(call.from_user.id):
+        return
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    data = call.data
+
+    if data == "back_main":
+        update_sessions.pop(chat_id, None)
+        send_or_edit(chat_id, format_dashboard_text(), get_main_keyboard(), msg_id)
+
+    elif data == "update_bot":
+        update_sessions[chat_id] = {"active": True, "chunks": [], "status_msg_id": None}
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Отменить обновление", callback_data="upd_cancel"))
+        send_or_edit(
+            chat_id,
+            "🔄 **Автообновление активировано!**\n"
+            "1️⃣ Скиньте файл `.py` документом.\n"
+            "2️⃣ ИЛИ отправьте код сообщениями и напишите **`1111`**.\n"
+            "3️⃣ ИЛИ обновите через веб-сайт на Render.",
+            kb,
+            msg_id,
         )
-        self.history[profile_id] = entries[-500:]
 
+    elif data == "upd_apply_now":
+        with update_lock:
+            full_code = get_sorted_buffer_code(chat_id)
+        if full_code:
+            apply_new_bot_code(chat_id, full_code)
 
-class TelegramError(RuntimeError):
-    pass
+    elif data == "upd_clear_buf":
+        with update_lock:
+            update_sessions[chat_id] = {"active": True, "chunks": [], "status_msg_id": None}
+        bot.answer_callback_query(call.id, "Буфер очищен!")
 
+    elif data == "upd_cancel":
+        update_sessions.pop(chat_id, None)
+        send_or_edit(chat_id, format_dashboard_text(), get_main_keyboard(), msg_id)
 
-class TelegramClient:
-    def __init__(self, token: str, timeout: int = 30) -> None:
-        self.token = token.strip()
-        self.timeout = timeout
-        self.base_url = f"https://api.telegram.org/bot{self.token}/"
-        self.offset = 0
+    elif data == "sys_rollback":
+        if os.path.exists(BACKUP_FILE):
+            with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+                apply_new_bot_code(chat_id, f.read())
+        else:
+            bot.answer_callback_query(call.id, "Резервная копия еще не создана!", show_alert=True)
 
-    def request(self, method: str, payload: Optional[dict[str, Any]] = None) -> Any:
-        body = urllib.parse.urlencode(payload or {}).encode()
-        request = urllib.request.Request(
-            self.base_url + method,
-            data=body,
-            headers={"User-Agent": f"{APP_NAME}/{VERSION}"},
-            method="POST",
+    elif data == "menu_f2p_farm":
+        auto_state = "🟢 ВКЛЮЧЕН (каждые 15 мин)" if bot_status["f2p_auto_all_enabled"] else "⚪ ВЫКЛЮЧЕН"
+        claimed_total = len(load_json_set(CLAIMED_F2P_FILE))
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("🎲 Добавить 5 рандомных F2P игр сейчас", callback_data="f2p_rand_5"),
+            InlineKeyboardButton("🎲 Добавить 15 рандомных F2P игр сейчас", callback_data="f2p_rand_15"),
+            InlineKeyboardButton("🔢 Указать свое число рандомных F2P игр", callback_data="f2p_rand_custom"),
+            InlineKeyboardButton(f"♾️ Авто-сбор ВСЕХ F2P (15 мин): {'Выключить 🔴' if bot_status['f2p_auto_all_enabled'] else 'Включить 🟢'}", callback_data="f2p_toggle_all"),
+            InlineKeyboardButton("🎯 Популярные F2P-хиты (CS2, Dota, PUBG)", callback_data="test_f2p"),
+            InlineKeyboardButton("⬅️ Назад в главное меню", callback_data="back_main"),
         )
+        send_or_edit(
+            chat_id,
+            f"🎮 **Генератор и Авто-сборщик всех Free-to-Play игр**\n\n"
+            f"• Авто-сбор (каждые 15 мин): **{auto_state}**\n"
+            f"• Последняя проверка: `{bot_status['last_f2p_check']}`\n"
+            f"• Добавлено F2P за сеанс: `{bot_status['f2p_added_count']} шт.` (В базе: `{claimed_total} шт.`)",
+            kb,
+            msg_id,
+        )
+
+    elif data in ("f2p_rand_5", "f2p_rand_15"):
+        cnt = 5 if data == "f2p_rand_5" else 15
+        bot.answer_callback_query(call.id, f"Добавляю {cnt} случайных F2P игр...")
+        notify_user(chat_id, f"⏳ Ищу в каталоге Steam и добавляю **{cnt} рандомных Free-to-Play игр**...")
+
+        def _run_rand(n):
+            added = steam.add_random_f2p_batch(n)
+            library_cache.pop(chat_id, None)
+            msg = f"🎉 **Добавлено {len(added)} рандомных F2P игр:**\n\n" + "\n".join(added) if added else "ℹ️ Игры на этой странице уже добавлены, попробуйте еще раз!"
+            notify_user(chat_id, msg, get_main_keyboard())
+
+        threading.Thread(target=_run_rand, args=(cnt,), daemon=True).start()
+
+    elif data == "f2p_rand_custom":
+        msg = bot.send_message(chat_id, "🔢 Сколько случайных Free-to-Play игр добавить? (1–35):")
+        bot.register_next_step_handler(msg, step_f2p_custom_count)
+
+    elif data == "f2p_toggle_all":
+        bot_status["f2p_auto_all_enabled"] = not bot_status["f2p_auto_all_enabled"]
+        steam.data["f2p_auto_all"] = bot_status["f2p_auto_all_enabled"]
+        save_session(steam.data)
+        call.data = "menu_f2p_farm"
+        handle_callbacks(call)
+
+    elif data == "menu_library":
+        kb = InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("📋 Все игры аккаунта", callback_data="lib_view_all_0"),
+            InlineKeyboardButton("🔒 Только купленные", callback_data="lib_view_paid_0"),
+            InlineKeyboardButton("❌ Только удаляемые", callback_data="lib_view_free_0"),
+            InlineKeyboardButton("💎 Аналитика библиотеки", callback_data="tool_lib_stats"),
+            InlineKeyboardButton("📄 Скачать список (.txt)", callback_data="lib_export_txt"),
+            InlineKeyboardButton("🎲 Случайная игра", callback_data="tool_random_game"),
+        ).add(InlineKeyboardButton("⬅️ Назад в главное меню", callback_data="back_main"))
+        send_or_edit(chat_id, "📚 **Полная библиотека Steam**\n`🔒 Купленные` защищены от удаления, `❌ Бесплатные` можно удалить в 1 клик.", kb, msg_id)
+
+    elif data.startswith("lib_view_"):
+        parts = data.split("_")
+        mode, page = parts[2], int(parts[3])
+        if page == 0 or chat_id not in library_cache:
+            bot.answer_callback_query(call.id, "Загружаю библиотеку из Steam...")
+            library_cache[chat_id] = steam.get_all_licenses()
+        all_items = library_cache.get(chat_id, [])
+        items = [x for x in all_items if (not x["removable"] if mode == "paid" else (x["removable"] if mode == "free" else True))]
+        per_page = 6
+        total_pages = max(1, (len(items) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        chunk = items[page * per_page : (page + 1) * per_page]
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.row(
+            InlineKeyboardButton(f"{'🔘' if mode=='all' else '⚪'} Все ({len(all_items)})", callback_data="lib_view_all_0"),
+            InlineKeyboardButton(f"{'🔘' if mode=='paid' else '⚪'} Купленные", callback_data="lib_view_paid_0"),
+            InlineKeyboardButton(f"{'🔘' if mode=='free' else '⚪'} Бесплатные", callback_data="lib_view_free_0"),
+        )
+        for idx, item in enumerate(chunk):
+            if item["removable"]:
+                kb.add(InlineKeyboardButton(f"❌ Удалить: {item['name']} ({item['date']})", callback_data=f"lib_del_{item['packageid']}_{mode}_{page}"))
+            else:
+                kb.add(InlineKeyboardButton(f"🔒 Куплено: {item['name']} ({item['date']})", callback_data=f"lib_locked_{idx}"))
+        nav_btns = []
+        if page > 0:
+            nav_btns.append(InlineKeyboardButton("⬅️ Пред.", callback_data=f"lib_view_{mode}_{page-1}"))
+        nav_btns.append(InlineKeyboardButton("🔄 Обновить", callback_data=f"lib_view_{mode}_0"))
+        if page < total_pages - 1:
+            nav_btns.append(InlineKeyboardButton("След. ➡️", callback_data=f"lib_view_{mode}_{page+1}"))
+        kb.row(*nav_btns)
+        kb.add(InlineKeyboardButton("⬅️ Назад в Библиотеку", callback_data="menu_library"))
+        send_or_edit(chat_id, f"📚 **Игр в списке: `{len(items)}`** (Стр. `{page + 1}` из `{total_pages}`):", kb, msg_id)
+
+    elif data.startswith("lib_locked_"):
+        bot.answer_callback_query(call.id, "🔒 Это купленная игра (или ключ). Её нельзя удалить!", show_alert=True)
+
+    elif data.startswith("lib_del_"):
+        parts = data.split("_")
+        pkg_id, mode, page = parts[2], parts[3], int(parts[4])
+        if steam.remove_license(pkg_id):
+            if chat_id in library_cache:
+                library_cache[chat_id] = [x for x in library_cache[chat_id] if x["packageid"] != pkg_id]
+            notify_user(chat_id, f"✅ Бесплатная лицензия `{pkg_id}` удалена!")
+        call.data = f"lib_view_{mode}_{page}"
+        handle_callbacks(call)
+
+    elif data == "lib_export_txt":
+        items = steam.get_all_licenses()
+        lines = [f"{i}. {it['name']} | {'[Бесплатная]' if it['removable'] else '[Куплена 🔒]'} | {it['date']}" for i, it in enumerate(items, 1)]
+        bio_bytes = io.BytesIO("\n".join(lines).encode("utf-8"))
+        bio_bytes.name = "steam_library.txt"
+        bot.send_document(chat_id, bio_bytes, caption=f"📄 Полный список игр (`{len(items)} шт.`)")
+
+    elif data == "menu_calc":
+        msg = bot.send_message(chat_id, "🧮 Отправьте **AppID** игры или ссылку на неё в Steam:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_calc_get_appid)
+
+    elif data.startswith("calc_from_appid_"):
+        show_game_and_ask_discount(chat_id, data.replace("calc_from_appid_", ""))
+
+    elif data.startswith("watch_set_"):
+        parts = data.split("_")
+        mode, app_id, target_disc = parts[2], parts[3], int(parts[4])
+        info = steam.get_game_price_info(app_id)
+        game_name = info["name"] if info else f"App {app_id}"
+        cur_disc = info["discount"] if info else 0
+        steam.data.setdefault("watchlist", {})[app_id] = {"name": game_name, "target_disc": 1 if mode == "any" else target_disc, "mode": mode, "last_discount": cur_disc}
+        save_session(steam.data)
+        if mode == "autobuy" and cur_disc >= target_disc and app_id not in bot_status["autobuy_tasks"]:
+            threading.Thread(target=trigger_delayed_autobuy, args=(chat_id, app_id, game_name, cur_disc), daemon=True).start()
+        notify_user(chat_id, f"✅ **Сохранено для «{game_name}» (`{app_id}`)!** (Цель: `-{target_disc}%`, Режим: `{mode}`)", get_main_keyboard())
+
+    elif data == "menu_discounts":
+        watchlist = steam.data.get("watchlist", {})
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("🧮 Рассчитать скидку в ₸ / Добавить игру", callback_data="menu_calc"),
+            InlineKeyboardButton("⭐ Импортировать из Списка желаемого Steam", callback_data="tool_wishlist"),
+            InlineKeyboardButton("🔍 Проверить цены сейчас", callback_data="disc_check_now"),
+        )
+        for appid, info in list(watchlist.items())[:8]:
+            m_icon = "🛒 Автобай" if info.get("mode") == "autobuy" else "🔔 Увед."
+            kb.add(InlineKeyboardButton(f"🗑 Удалить: {info.get('name', appid)} [{m_icon} -{info.get('target_disc', 1)}%]", callback_data=f"disc_rem_{appid}"))
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+        lines = [f"• **{v.get('name')}** (`{k}`) — цель `-{v.get('target_disc', 1)}%` (сейчас `-{v.get('last_discount', 0)}%`)" for k, v in watchlist.items()]
+        send_or_edit(chat_id, f"📉 **Радар скидок (каждые 15 мин)**\nПосл. проверка: `{bot_status['last_discount_check']}`\n\n" + ("\n".join(lines) or "_Список пуст_"), kb, msg_id)
+
+    elif data.startswith("disc_rem_"):
+        steam.data.get("watchlist", {}).pop(data.replace("disc_rem_", ""), None)
+        save_session(steam.data)
+        call.data = "menu_discounts"
+        handle_callbacks(call)
+
+    elif data == "disc_check_now":
+        rep = check_discounts(force_report=True)
+        notify_user(chat_id, rep or "ℹ️ Список отслеживания пуст.", reply_markup=get_main_keyboard())
+
+    elif data == "menu_search":
+        msg = bot.send_message(chat_id, "🔎 Напишите название игры для поиска:")
+        bot.register_next_step_handler(msg, step_search_game)
+
+    elif data == "menu_specials":
+        specials = steam.get_top_daily_specials()
+        kb = InlineKeyboardMarkup(row_width=1).add(InlineKeyboardButton("🏆 Показать Лидеров продаж (Топ чарта KZ)", callback_data="tool_top_sellers"))
+        lines = ["🔥 **Топ скидок дня в Steam (Тенге ₸):**\n"]
+        for sp in specials:
+            lines.append(f"• **{sp['name']}** (`{sp['appid']}`) — **-{sp['discount']}%** → `{sp['final_kzt']}`")
+            kb.add(InlineKeyboardButton(f"🧮 Калькулятор: {sp['name']} (-{sp['discount']}%)", callback_data=f"calc_from_appid_{sp['appid']}"))
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+        send_or_edit(chat_id, "\n".join(lines), kb, msg_id)
+
+    elif data == "tool_top_sellers":
+        tops = steam.get_top_sellers_kz()
+        kb = InlineKeyboardMarkup(row_width=1)
+        lines = ["🏆 **Лидеры продаж Steam в Казахстане:**\n"]
+        for i, t in enumerate(tops, 1):
+            lines.append(f"{i}. **{t['name']}** — `{t['price']}`")
+            kb.add(InlineKeyboardButton(f"🧮 Выбрать: {t['name']} ({t['price']})", callback_data=f"calc_from_appid_{t['appid']}"))
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_specials"))
+        send_or_edit(chat_id, "\n".join(lines), kb, msg_id)
+
+    elif data == "menu_tools":
+        kb = InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("👥 Онлайн игры (Live)", callback_data="tool_players"),
+            InlineKeyboardButton("🌍 Цены по регионам", callback_data="tool_reg_prices"),
+            InlineKeyboardButton("🎁 Собрать бесплатные DLC", callback_data="tool_free_dlc"),
+            InlineKeyboardButton("📰 Патчи и новости игры", callback_data="tool_game_news"),
+            InlineKeyboardButton("🏆 Редкие достижения", callback_data="tool_achievements"),
+            InlineKeyboardButton("💻 Системные треб. и Рейтинг", callback_data="tool_sys_reqs"),
+            InlineKeyboardButton("⭐ Список желаемого Steam", callback_data="tool_wishlist"),
+            InlineKeyboardButton("💎 Аналитика библиотеки", callback_data="tool_lib_stats"),
+            InlineKeyboardButton("📦 Инспектор SubID пакета", callback_data="tool_inspect_sub"),
+            InlineKeyboardButton("🛒 Очистить корзину Steam", callback_data="tool_clear_cart"),
+            InlineKeyboardButton("🔑 Активировать ключ Steam", callback_data="tool_redeem_key"),
+            InlineKeyboardButton("🧾 История покупок", callback_data="tool_history"),
+            InlineKeyboardButton("🎲 Случайная игра", callback_data="tool_random_game"),
+            InlineKeyboardButton("🕵️ Статус Steam и CS2", callback_data="tool_server_status"),
+            InlineKeyboardButton("🚀 Пакет F2P-хитов (5 шт)", callback_data="tool_batch_f2p"),
+            InlineKeyboardButton("📝 Личные заметки", callback_data="tool_notes"),
+            InlineKeyboardButton("🔕 Тихий режим (Звук)", callback_data="tool_toggle_silent"),
+            InlineKeyboardButton("🧹 Очистить кэш бота", callback_data="tool_clear_cache"),
+        ).add(InlineKeyboardButton("⬅️ Назад в главное меню", callback_data="back_main"))
+        send_or_edit(chat_id, "🛠 **Расширенные инструменты и Статистика игр (20+ функций):**", kb, msg_id)
+
+    elif data == "tool_players":
+        msg = bot.send_message(chat_id, "👥 Отправьте **AppID** игры (например `730` для CS2):", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_tool_players)
+
+    elif data == "tool_reg_prices":
+        msg = bot.send_message(chat_id, "🌍 Отправьте **AppID** игры для сравнения цены в 4 странах:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_tool_regional_prices)
+
+    elif data == "tool_free_dlc":
+        msg = bot.send_message(chat_id, "🎁 Отправьте **AppID** игры для поиска бесплатных DLC:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_tool_free_dlc)
+
+    elif data == "tool_game_news":
+        msg = bot.send_message(chat_id, "📰 Отправьте **AppID** игры для чтения новостей:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_tool_game_news)
+
+    elif data == "tool_achievements":
+        msg = bot.send_message(chat_id, "🏆 Отправьте **AppID** игры для просмотра достижений:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_tool_achievements)
+
+    elif data == "tool_sys_reqs":
+        msg = bot.send_message(chat_id, "💻 Отправьте **AppID** игры для просмотра требований ПК и рейтинга:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_tool_sys_reqs)
+
+    elif data == "tool_inspect_sub":
+        msg = bot.send_message(chat_id, "📦 Отправьте **SubID** пакета Steam:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_tool_inspect_sub)
+
+    elif data == "tool_notes":
+        notes = steam.data.get("notes", [])
+        n_txt = "\n".join([f"{i+1}. `{n}`" for i, n in enumerate(notes)]) or "_Заметок пока нет_"
+        kb = InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("➕ Добавить заметку", callback_data="note_add"),
+            InlineKeyboardButton("🗑 Очистить заметки", callback_data="note_clear"),
+            InlineKeyboardButton("⬅️ Назад", callback_data="menu_tools"),
+        )
+        send_or_edit(chat_id, f"📝 **Ваши заметки:**\n\n{n_txt}", kb, msg_id)
+
+    elif data == "note_add":
+        msg = bot.send_message(chat_id, "✏️ Введите текст заметки:")
+        bot.register_next_step_handler(msg, step_add_note)
+
+    elif data == "note_clear":
+        steam.data["notes"] = []
+        save_session(steam.data)
+        call.data = "tool_notes"
+        handle_callbacks(call)
+
+    elif data == "tool_wishlist":
+        w_items = steam.get_wishlist_items()
+        if not w_items:
+            notify_user(chat_id, "ℹ️ Ваш Список желаемого пуст или скрыт.", get_main_keyboard())
+            return
+        kb = InlineKeyboardMarkup(row_width=1).add(InlineKeyboardButton("📥 Импортировать ВСЕ в Радар скидок", callback_data="wishlist_import_all"))
+        lines = [f"⭐ **Ваш Список желаемого ({len(w_items)} игр):**\n"]
+        for it in w_items:
+            lines.append(f"• **{it['name']}** (`{it['appid']}`) — `{it['price']}`")
+            kb.add(InlineKeyboardButton(f"🧮 Калькулятор: {it['name']}", callback_data=f"calc_from_appid_{it['appid']}"))
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_tools"))
+        send_or_edit(chat_id, "\n".join(lines), kb, msg_id)
+
+    elif data == "wishlist_import_all":
+        w_items = steam.get_wishlist_items()
+        steam.data.setdefault("watchlist", {})
+        for it in w_items:
+            steam.data["watchlist"].setdefault(it["appid"], {"name": it["name"], "target_disc": 20, "mode": "notify", "last_discount": it["discount"]})
+        save_session(steam.data)
+        call.data = "menu_discounts"
+        handle_callbacks(call)
+
+    elif data == "tool_lib_stats":
+        items = library_cache.get(chat_id) or steam.get_all_licenses()
+        library_cache[chat_id] = items
+        paid_cnt = sum(1 for x in items if not x["removable"])
+        free_cnt = sum(1 for x in items if x["removable"])
+        oldest = items[-1]["name"] if items else "—"
+        newest = items[0]["name"] if items else "—"
+        text = f"💎 **Аналитика библиотеки**\n\n📊 Всего игр: `{len(items)}`\n🔒 Купленных: `{paid_cnt}`\n🆓 Бесплатных: `{free_cnt}`\n🆕 Новая: `{newest}`\n🏛 Первая: `{oldest}`"
+        send_or_edit(chat_id, text, InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_tools")), msg_id)
+
+    elif data == "tool_clear_cart":
+        steam.clear_steam_cart()
+        notify_user(chat_id, "🛒 **Корзина Steam очищена!**", get_main_keyboard())
+
+    elif data == "tool_redeem_key":
+        msg = bot.send_message(chat_id, "🔑 Отправьте ключ Steam (`AAAAA-BBBBB-CCCCC`):", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, step_redeem_key)
+
+    elif data == "tool_history":
+        hist = steam.get_purchase_history()
+        send_or_edit(chat_id, "🧾 **Последние операции:**\n\n" + ("\n".join(hist) or "Пусто"), InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_tools")), msg_id)
+
+    elif data == "tool_random_game":
+        items = library_cache.get(chat_id) or steam.get_all_licenses()
+        if items:
+            pick = random.choice(items)
+            notify_user(chat_id, f"🎲 **Случайный выбор:**\n🎮 **{pick['name']}** (`{pick['date']}`)", get_main_keyboard())
+
+    elif data == "tool_server_status":
+        cs2_p = steam.get_live_player_count(730) or "Н/Д"
+        dota_p = steam.get_live_player_count(570) or "Н/Д"
+        send_or_edit(chat_id, f"🕵️ **Статус Steam:** 🟢 Онлайн\n🔫 CS2: `{cs2_p}` игроков\n⚔️ Dota 2: `{dota_p}` игроков", InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_tools")), msg_id)
+
+    elif data == "tool_batch_f2p":
+        for aid in ("730", "570", "440", "1172470", "291550"):
+            sid = steam.get_subid_from_appid(aid)
+            if sid:
+                steam.add_free_license(sid)
+        notify_user(chat_id, "✅ Пакет из 5 F2P-хитов добавлен!", get_main_keyboard())
+
+    elif data == "tool_toggle_silent":
+        steam.data["silent_mode"] = not steam.data.get("silent_mode", False)
+        save_session(steam.data)
+        send_or_edit(chat_id, format_dashboard_text(), get_main_keyboard(), msg_id)
+
+    elif data == "tool_clear_cache":
+        library_cache.clear()
+        calc_state.clear()
+        bot.answer_callback_query(call.id, "🧹 Кэш очищен!", show_alert=True)
+
+    elif data == "menu_profile":
+        ok, balance = steam.check_health()
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("📝 Изменить «О себе»", callback_data="change_bio"),
+            InlineKeyboardButton("🏷 Изменить Никнейм", callback_data="change_nickname"),
+            InlineKeyboardButton("👤 Изменить Настоящее имя", callback_data="change_realname"),
+            InlineKeyboardButton("🔄 Сменить аккаунт Steam", callback_data="login_steam"),
+            InlineKeyboardButton("⬅️ Назад", callback_data="back_main"),
+        )
+        send_or_edit(chat_id, f"👤 **Профиль Steam**\nАккаунт: `{steam.data.get('account_name')}`\n💰 Баланс: `{balance}`", kb, msg_id)
+
+    elif data == "change_bio":
+        msg = bot.send_message(chat_id, "✏️ Введите новый текст «О себе»:")
+        bot.register_next_step_handler(msg, step_change_bio)
+
+    elif data == "change_nickname":
+        msg = bot.send_message(chat_id, "🏷 Введите новый Никнейм:")
+        bot.register_next_step_handler(msg, step_change_nickname)
+
+    elif data == "change_realname":
+        msg = bot.send_message(chat_id, "👤 Введите новое Настоящее имя:")
+        bot.register_next_step_handler(msg, step_change_realname)
+
+    elif data == "menu_giveaways":
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("🔍 Проверить 100% раздачи сейчас", callback_data="check_now"),
+            InlineKeyboardButton("⬅️ Назад", callback_data="back_main"),
+        )
+        send_or_edit(chat_id, f"🎁 **Автосбор 100% раздач**\nПосл. проверка: `{bot_status['last_check']}`\nЗабрано: `{bot_status['claimed_count']}`", kb, msg_id)
+
+    elif data == "check_now":
+        cnt = check_giveaways()
+        notify_user(chat_id, f"ℹ️ Новых раздач добавлено: {cnt}", get_main_keyboard())
+
+    elif data == "menu_ping":
+        history_lines = "\n".join(bot_status["ping_history"][-8:]) or "_Пока нет записей_"
+        kb = InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("🔄 Обновить", callback_data="menu_ping"),
+            InlineKeyboardButton("⚡ Пингануть", callback_data="force_ping"),
+            InlineKeyboardButton("⏱ Пинг: 4 мин", callback_data="ping_int_4"),
+            InlineKeyboardButton("⏱ Пинг: 14 мин", callback_data="ping_int_14"),
+            InlineKeyboardButton("🌐 Сменить URL", callback_data="set_render_url"),
+            InlineKeyboardButton("⬅️ Назад", callback_data="back_main"),
+        )
+        send_or_edit(chat_id, f"📡 **Тихий самопинг**\nURL: `{steam.data.get('render_url')}/ping`\nПингов: `{bot_status['ping_count']}`\n\n{history_lines}", kb, msg_id)
+
+    elif data in ("ping_int_4", "ping_int_14"):
+        bot_status["ping_interval_min"] = 4 if data == "ping_int_4" else 14
+        call.data = "menu_ping"
+        handle_callbacks(call)
+
+    elif data == "force_ping":
+        do_single_ping()
+        call.data = "menu_ping"
+        handle_callbacks(call)
+
+    elif data == "menu_system":
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("🔄 Обновить код бота", callback_data="update_bot"),
+            InlineKeyboardButton("⏪ Откатить к резервной копии", callback_data="sys_rollback"),
+            InlineKeyboardButton("📥 Скачать текущий файл (.py)", callback_data="sys_download_code"),
+            InlineKeyboardButton("💾 Получить SESSION_BASE64", callback_data="get_b64"),
+            InlineKeyboardButton("📥 Вставить SESSION_BASE64", callback_data="import_b64"),
+            InlineKeyboardButton("⬅️ Назад", callback_data="back_main"),
+        )
+        send_or_edit(chat_id, f"⚙️ **Система**\nСборка: `{steam.data.get('last_update_time', 'Базовая')}`\nСайт: `{steam.data.get('render_url')}`", kb, msg_id)
+
+    elif data == "sys_download_code":
+        with open(os.path.abspath(__file__), "rb") as f:
+            bot.send_document(chat_id, f, caption="📄 Текущий рабочий код бота")
+
+    elif data == "login_steam":
+        msg = bot.send_message(chat_id, "🔑 Шаг 1/3. Отправьте ваш логин Steam:")
+        bot.register_next_step_handler(msg, step_get_username)
+
+    elif data == "import_b64":
+        msg = bot.send_message(chat_id, "📥 Отправьте строку SESSION_BASE64:")
+        bot.register_next_step_handler(msg, step_import_b64)
+
+    elif data == "get_b64":
+        notify_user(chat_id, f"💾 `{export_session_b64(steam.data)}`", reply_markup=get_main_keyboard())
+
+    elif data == "test_f2p":
+        kb = InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("The Sims 4", callback_data="f2p_1222670"),
+            InlineKeyboardButton("PUBG", callback_data="f2p_578080"),
+            InlineKeyboardButton("Brawlhalla", callback_data="f2p_291550"),
+            InlineKeyboardButton("Dota 2", callback_data="f2p_570"),
+            InlineKeyboardButton("🔢 Ввести свой AppID", callback_data="f2p_custom"),
+            InlineKeyboardButton("⬅️ Назад", callback_data="menu_f2p_farm"),
+        )
+        send_or_edit(chat_id, "🎮 Выберите бесплатную игру или введите свой AppID:", kb, msg_id)
+
+    elif data.startswith("f2p_"):
+        target = data.replace("f2p_", "")
+        if target == "custom":
+            msg = bot.send_message(chat_id, "🔢 Отправьте AppID бесплатной игры:")
+            bot.register_next_step_handler(msg, step_custom_f2p)
+        else:
+            add_f2p_game(chat_id, target)
+
+    elif data == "set_render_url":
+        msg = bot.send_message(chat_id, "🌐 Отправьте ссылку на ваш Render-сервис:")
+        bot.register_next_step_handler(msg, step_set_render_url)
+
+
+# ----------------- ФУНКЦИИ ШАГОВ -----------------
+def step_f2p_custom_count(message):
+    chat_id = message.chat.id
+    raw_n = re.sub(r"\D", "", message.text.strip())
+    cnt = max(1, min(35, int(raw_n))) if raw_n else 5
+    notify_user(chat_id, f"⏳ Ищу и добавляю **{cnt} рандомных Free-to-Play игр**...")
+
+    def _run():
+        added = steam.add_random_f2p_batch(cnt)
+        library_cache.pop(chat_id, None)
+        msg = f"🎉 **Добавлено {len(added)} игр:**\n\n" + "\n".join(added) if added else "ℹ️ Попробуйте еще раз!"
+        notify_user(chat_id, msg, get_main_keyboard())
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def step_tool_players(message):
+    app_id = re.sub(r"\D", "", message.text.strip())
+    cnt = steam.get_live_player_count(app_id) if app_id else None
+    info = steam.get_game_price_info(app_id) if app_id else None
+    name = info["name"] if info else f"App {app_id}"
+    notify_user(message.chat.id, f"👥 **Онлайн в «{name}» (`{app_id}`):** `{cnt if cnt is not None else 'Н/Д'} чел.`", get_main_keyboard())
+
+
+def step_tool_regional_prices(message):
+    m = re.search(r"/app/(\d+)", message.text)
+    app_id = m.group(1) if m else re.sub(r"\D", "", message.text.strip())
+    name, lines = steam.compare_regional_prices(app_id)
+    notify_user(message.chat.id, f"🌍 **Цены «{name}» (`{app_id}`):**\n\n" + "\n".join(lines), get_main_keyboard())
+
+
+def step_tool_free_dlc(message):
+    app_id = re.sub(r"\D", "", message.text.strip())
+    added = steam.add_free_dlcs_for_game(app_id) if app_id else []
+    msg = f"🎁 **Добавлены DLC ({len(added)} шт.):**\n\n" + "\n".join(added) if added else "ℹ️ Бесплатных DLC не найдено."
+    notify_user(message.chat.id, msg, get_main_keyboard())
+
+
+def step_tool_game_news(message):
+    app_id = re.sub(r"\D", "", message.text.strip())
+    news = steam.get_game_news(app_id) if app_id else []
+    notify_user(message.chat.id, f"📰 **Новости (`{app_id}`):**\n\n" + ("\n\n".join(news) or "Нет новостей."), get_main_keyboard())
+
+
+def step_tool_achievements(message):
+    app_id = re.sub(r"\D", "", message.text.strip())
+    ach = steam.get_global_achievements(app_id) if app_id else None
+    if not ach:
+        notify_user(message.chat.id, "ℹ️ Достижения не найдены.", get_main_keyboard())
+        return
+    easy = "\n".join([f"• `{a['name']}` — **{float(a['percent']):.1f}%**" for a in ach["easiest"]])
+    rare = "\n".join([f"• `{a['name']}` — **{float(a['percent']):.2f}%**" for a in ach["rarest"]])
+    notify_user(message.chat.id, f"🏆 **Достижения (`{app_id}`):**\n\n🟢 Частые:\n{easy}\n\n💎 Редкие:\n{rare}", get_main_keyboard())
+
+
+def step_tool_sys_reqs(message):
+    app_id = re.sub(r"\D", "", message.text.strip())
+    info = steam.get_game_price_info(app_id) if app_id else None
+    if not info:
+        notify_user(message.chat.id, "❌ Игра не найдена.", get_main_keyboard())
+        return
+    notify_user(
+        message.chat.id,
+        f"💻 **«{info['name']}» (`{app_id}`)**\n⭐ Metacritic: `{info['metacritic']}` | Отзывов: `{info['recommendations']}`\n💰 Цена: `{info['final_formatted']}`\n\n🔹 Мин: {info['pc_min']}\n\n🔸 Рек: {info['pc_rec']}",
+        get_main_keyboard(),
+    )
+
+
+def step_tool_inspect_sub(message):
+    sub_id = re.sub(r"\D", "", message.text.strip())
+    info = steam.inspect_package_subid(sub_id) if sub_id else None
+    if not info:
+        notify_user(message.chat.id, "❌ Пакет не найден.", get_main_keyboard())
+        return
+    apps_str = "\n".join([f"• {a}" for a in info["apps"][:15]]) or "Не указаны"
+    notify_user(message.chat.id, f"📦 **Пакет `{info['subid']}` — {info['name']}**\n💰 Цена: `{info['price_kzt']}`\n\n{apps_str}", get_main_keyboard())
+
+
+def step_add_note(message):
+    steam.data.setdefault("notes", []).append(message.text.strip())
+    save_session(steam.data)
+    notify_user(message.chat.id, "✅ Заметка сохранена!", get_main_keyboard())
+
+
+def step_calc_get_appid(message):
+    m = re.search(r"/app/(\d+)", message.text)
+    app_id = m.group(1) if m else re.sub(r"\D", "", message.text.strip())
+    if app_id:
+        show_game_and_ask_discount(message.chat.id, app_id)
+
+
+def show_game_and_ask_discount(chat_id, app_id):
+    info = steam.get_game_price_info(app_id)
+    if not info:
+        notify_user(chat_id, f"❌ Игра `{app_id}` не найдена.", get_main_keyboard())
+        return
+    if info["is_free"]:
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➕ Добавить бесплатно", callback_data=f"f2p_{app_id}"), InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+        notify_user(chat_id, f"🎮 **{info['name']}** уже бесплатная (0 ₸)!", kb)
+        return
+    calc_state[chat_id] = info
+    kb = InlineKeyboardMarkup(row_width=2).add(
+        InlineKeyboardButton("🛒 Автобай -30%", callback_data=f"watch_set_autobuy_{app_id}_30"),
+        InlineKeyboardButton("🛒 Автобай -50%", callback_data=f"watch_set_autobuy_{app_id}_50"),
+        InlineKeyboardButton("🛒 Автобай -75%", callback_data=f"watch_set_autobuy_{app_id}_75"),
+        InlineKeyboardButton("🔔 Любая скидка", callback_data=f"watch_set_any_{app_id}_1"),
+    ).add(InlineKeyboardButton("⬅️ Отмена", callback_data="back_main"))
+    msg = bot.send_message(chat_id, f"🎮 **{info['name']}** (`{app_id}`)\n💰 Полная цена: **`{info['initial_kzt']:g} ₸`** (сейчас: `{info['final_formatted']}`)\n\n🔢 Введите желаемый процент скидки (1–99):", parse_mode="Markdown", reply_markup=kb)
+    bot.register_next_step_handler(msg, step_calc_discount_percent)
+
+
+def step_calc_discount_percent(message):
+    chat_id = message.chat.id
+    info = calc_state.get(chat_id)
+    if not info:
+        return
+    raw_num = re.sub(r"\D", "", message.text.strip()) or "50"
+    target_disc = max(1, min(99, int(raw_num)))
+    base_kzt = info["initial_kzt"]
+    discounted_kzt = round(base_kzt * (100 - target_disc) / 100.0, 2)
+    saved_kzt = round(base_kzt - discounted_kzt, 2)
+    app_id = info["appid"]
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton(f"🛒 Автопокупка (через 5–15 мин) при -{target_disc}%", callback_data=f"watch_set_autobuy_{app_id}_{target_disc}"),
+        InlineKeyboardButton(f"🔔 Только уведомить при -{target_disc}%", callback_data=f"watch_set_notify_{app_id}_{target_disc}"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="back_main"),
+    )
+    notify_user(chat_id, f"🧮 **Расчет скидки -{target_disc}%:**\n🎮 **{info['name']}**\n💵 Полная цена: `{base_kzt:g} ₸`\n🏷 **Со скидкой:** **`{discounted_kzt:g} ₸`** (экономия `{saved_kzt:g} ₸`)", kb)
+
+
+def trigger_delayed_autobuy(chat_id, app_id, game_name, cur_disc):
+    if app_id in bot_status["autobuy_tasks"]:
+        return
+    bot_status["autobuy_tasks"].add(app_id)
+    delay_sec = random.randint(300, 900)
+    notify_user(chat_id, f"🎯 **Скидка -{cur_disc}% на «{game_name}»!** Автопокупка через **{round(delay_sec/60, 1)} мин.**")
+    time.sleep(delay_sec)
+    res = steam.auto_purchase_game(app_id)
+    bot_status["autobuy_tasks"].discard(app_id)
+    notify_user(chat_id, f"🛒 **Результат автопокупки «{game_name}»:**\n{res.get('msg')}")
+
+
+def step_search_game(message):
+    results = steam.search_games_by_name(message.text.strip())
+    kb = InlineKeyboardMarkup(row_width=1)
+    for r in results:
+        kb.add(InlineKeyboardButton(f"🧮 {r['name']} ({r['price_str']})", callback_data=f"calc_from_appid_{r['appid']}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+    notify_user(message.chat.id, "🔎 **Результаты поиска:**", kb)
+
+
+def step_redeem_key(message):
+    res = steam.redeem_cd_key(message.text.strip())
+    notify_user(message.chat.id, f"✅ Ключ активирован: {res.get('games')}" if res.get("ok") else "❌ Ошибка активации ключа.", get_main_keyboard())
+
+
+def step_change_bio(message):
+    steam.update_profile_field(summary=message.text.strip())
+    notify_user(message.chat.id, "✅ Графа «О себе» обновлена!", get_main_keyboard())
+
+
+def step_change_nickname(message):
+    steam.update_profile_field(persona_name=message.text.strip())
+    notify_user(message.chat.id, "✅ Никнейм изменен!", get_main_keyboard())
+
+
+def step_change_realname(message):
+    steam.update_profile_field(real_name=message.text.strip())
+    notify_user(message.chat.id, "✅ Настоящее имя изменено!", get_main_keyboard())
+
+
+def step_get_username(message):
+    pending_auth[message.chat.id] = {"username": message.text.strip()}
+    msg = bot.send_message(message.chat.id, "🔒 Шаг 2/3. Отправьте пароль:")
+    bot.register_next_step_handler(msg, step_get_password)
+
+
+def step_get_password(message):
+    chat_id = message.chat.id
+    pwd = message.text.strip()
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+    if chat_id in pending_auth:
+        pending_auth[chat_id]["password"] = pwd
+        msg = bot.send_message(chat_id, "🛡 Шаг 3/3. Отправьте 5-значный код Steam Guard:")
+        bot.register_next_step_handler(msg, step_get_guard_code)
+
+
+def step_get_guard_code(message):
+    chat_id = message.chat.id
+    auth_data = pending_auth.pop(chat_id, None)
+    if auth_data and "password" in auth_data:
+        res = steam.atomic_login(auth_data["username"], auth_data["password"], message.text.strip())
+        notify_user(chat_id, "✅ Успешный вход!" if res.get("ok") else f"❌ Ошибка: {res.get('error')}", get_main_keyboard())
+
+
+def step_import_b64(message):
+    try:
+        decoded = json.loads(base64.b64decode(message.text.strip()).decode("utf-8"))
+        decoded["admin_id"] = message.from_user.id
+        steam.data = decoded
+        save_session(steam.data)
+        notify_user(message.chat.id, "✅ Сессия успешно импортирована!", get_main_keyboard())
+    except Exception as e:
+        notify_user(message.chat.id, f"❌ Ошибка: {e}", get_main_keyboard())
+
+
+def step_custom_f2p(message):
+    app_id = re.sub(r"\D", "", message.text.strip())
+    if app_id:
+        add_f2p_game(message.chat.id, app_id)
+
+
+def add_f2p_game(chat_id, app_id):
+    sub_id = steam.get_subid_from_appid(app_id)
+    if sub_id and steam.add_free_license(sub_id):
+        bot_status["claimed_count"] += 1
+        bot_status["f2p_added_count"] += 1
+        library_cache.pop(chat_id, None)
+        notify_user(chat_id, f"✅ **Игра `{app_id}` добавлена в библиотеку!**", get_main_keyboard())
+    else:
+        notify_user(chat_id, "❌ Не удалось активировать лицензию.", get_main_keyboard())
+
+
+def step_set_render_url(message):
+    url = message.text.strip().rstrip("/")
+    if not url.startswith("http"):
+        url = "https://" + url
+    steam.data["render_url"] = url
+    save_session(steam.data)
+    tok_config["render_url"] = url
+    notify_user(message.chat.id, f"✅ URL самопинга сохранен: `{url}/ping`", get_main_keyboard())
+
+
+# ----------------- ФОНОВЫЕ ЦИКЛЫ (15 МИН) -----------------
+def check_discounts(force_report=False):
+    watchlist = steam.data.get("watchlist", {})
+    if not watchlist:
+        return ""
+    bot_status["last_discount_check"] = time.strftime("%H:%M:%S")
+    admin_id = steam.data.get("admin_id")
+    report_lines = ["📊 **Цены по вашему радару:**\n"]
+    for app_id, saved in list(watchlist.items()):
+        info = steam.get_game_price_info(app_id)
+        if not info:
+            continue
+        cur_disc = info["discount"]
+        target_disc = saved.get("target_disc", 1)
+        mode = saved.get("mode", "notify")
+        report_lines.append(f"• **{info['name']}**: `{info['final_formatted']}` (-{cur_disc}%, цель -{target_disc}%)")
+        if cur_disc >= target_disc and cur_disc != saved.get("last_discount", 0) and admin_id:
+            if mode == "autobuy":
+                threading.Thread(target=trigger_delayed_autobuy, args=(admin_id, app_id, info["name"], cur_disc), daemon=True).start()
+            else:
+                notify_user(admin_id, f"🔥 **Скидка -{cur_disc}% на {info['name']}!**\nЦена: `{info['final_formatted']}`")
+        steam.data["watchlist"][app_id]["last_discount"] = cur_disc
+    save_session(steam.data)
+    return "\n".join(report_lines) if force_report else ""
+
+
+def discounts_loop():
+    while True:
+        time.sleep(CHECK_DISCOUNTS_INTERVAL)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise TelegramError(f"HTTP {exc.code}: {detail[:300]}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError, ConnectionError) as exc:
-            raise TelegramError(f"Network error (Telegram): {exc}") from exc
-
-        if not result.get("ok"):
-            raise TelegramError(str(result.get("description", "ошибка Telegram")))
-        return result.get("result")
-
-    def get_me(self) -> dict[str, Any]:
-        result = self.request("getMe")
-        return result if isinstance(result, dict) else {}
-
-    def send_message(
-        self, chat_id: str, text: str, reply_markup: Optional[dict[str, Any]] = None
-    ) -> None:
-        self.request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text[:4096],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": "true",
-                "reply_markup": json.dumps(
-                    reply_markup or TELEGRAM_KEYBOARD, ensure_ascii=False
-                ),
-            },
-        )
-
-    def edit_message_text(
-        self,
-        chat_id: str,
-        text: str,
-        message_id: int,
-        reply_markup: Optional[dict[str, Any]] = None,
-    ) -> None:
-        self.request(
-            "editMessageText",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text[:4096],
-                "parse_mode": "HTML",
-                "reply_markup": json.dumps(reply_markup, ensure_ascii=False)
-                if reply_markup
-                else "",
-            },
-        )
-
-    def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
-        try:
-            self.request(
-                "answerCallbackQuery",
-                {"callback_query_id": callback_query_id, "text": text},
-            )
+            if steam.is_configured():
+                check_discounts()
         except Exception:
             pass
 
-    def send_document(self, chat_id: str, path: Path, caption: str = "") -> None:
-        boundary = f"----AniVoxMonitor{os.urandom(8).hex()}"
-        file_bytes = path.read_bytes()
-        parts: list[bytes] = []
 
-        def field(name: str, value: str) -> None:
-            parts.extend(
-                [
-                    f"--{boundary}\r\n".encode(),
-                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
-                    value.encode("utf-8"),
-                    b"\r\n",
-                ]
-            )
-
-        field("chat_id", chat_id)
-        if caption:
-            field("caption", caption[:1024])
-
-        content_type = (
-            b"Content-Type: text/html\r\n\r\n"
-            if path.name.endswith(".html")
-            else b"Content-Type: application/json\r\n\r\n"
-        )
-
-        parts.extend(
-            [
-                f"--{boundary}\r\n".encode(),
-                (
-                    'Content-Disposition: form-data; name="document"; '
-                    f'filename="{path.name}"\r\n'
-                ).encode(),
-                content_type,
-                file_bytes,
-                b"\r\n",
-                f"--{boundary}--\r\n".encode(),
-            ]
-        )
-        request = urllib.request.Request(
-            self.base_url + "sendDocument",
-            data=b"".join(parts),
-            headers={
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "User-Agent": f"{APP_NAME}/{VERSION}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-            err_details = (
-                exc.read().decode()
-                if isinstance(exc, urllib.error.HTTPError)
-                else str(exc)
-            )
-            raise TelegramError(f"не удалось отправить файл: {err_details}") from exc
-        if not result.get("ok"):
-            raise TelegramError(str(result.get("description", "ошибка отправки файла")))
-
-    def get_updates(self, timeout: int = 5) -> list[dict[str, Any]]:
-        result = self.request(
-            "getUpdates",
-            {
-                "offset": str(self.offset),
-                "timeout": str(max(0, min(25, timeout))),
-                "allowed_updates": json.dumps(["message", "callback_query"]),
-            },
-        )
-        updates = result if isinstance(result, list) else []
-        for item in updates:
-            if isinstance(item, dict) and isinstance(item.get("update_id"), int):
-                self.offset = item["update_id"] + 1
-        return updates
-
-
-class FetchResult:
-    def __init__(
-        self,
-        ok: bool,
-        profile_id: str,
-        url: str,
-        nickname: str = "неизвестно",
-        level: str = "неизвестно",
-        presence: str = "неизвестно",
-        title: str = "",
-        error: str = "",
-        source: str = "AniVox WebSocket /api",
-        last_seen_timestamp: float = 0,
-    ) -> None:
-        self.ok = ok
-        self.profile_id = profile_id
-        self.url = url
-        self.nickname = nickname or "неизвестно"
-        self.level = level or "неизвестно"
-        self.presence = presence or "неизвестно"
-        self.title = title
-        self.error = error
-        self.source = source
-        self.last_seen_timestamp = last_seen_timestamp
-        self.checked_at = almaty_now()
-
-    @property
-    def signature(self) -> str:
-        if self.presence.startswith("Смотрит:"):
-            state = "watching:" + self.title.lower()
-        elif self.presence.startswith("Онлайн"):
-            state = "online"
-        else:
-            state = "offline"
-        return "|".join(
-            (self.nickname.lower(), self.level, state, self.title.lower())
-        ).lower()
-
-
-def recv_exact(sock: socket.socket, length: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = length
-    while remaining:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise ConnectionError("AniVox WebSocket закрыл соединение")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def ws_send_text(sock: socket.socket, payload: dict[str, Any]) -> None:
-    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    mask = os.urandom(4)
-    masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(data))
-    length = len(data)
-    if length < 126:
-        header = bytes((0x81, 0x80 | length))
-    elif length < 65536:
-        header = bytes((0x81, 0x80 | 126)) + struct.pack("!H", length)
-    else:
-        header = bytes((0x81, 0x80 | 127)) + struct.pack("!Q", length)
-    sock.sendall(header + mask + masked)
-
-
-def ws_read_message(sock: socket.socket) -> Optional[str]:
-    fragments: list[bytes] = []
+def f2p_auto_all_loop():
     while True:
-        header = recv_exact(sock, 2)
-        opcode = header[0] & 0x0F
-        masked = bool(header[1] & 0x80)
-        length = header[1] & 0x7F
-        if length == 126:
-            length = struct.unpack("!H", recv_exact(sock, 2))[0]
-        elif length == 127:
-            length = struct.unpack("!Q", recv_exact(sock, 8))[0]
-        mask = recv_exact(sock, 4) if masked else b""
-        data = recv_exact(sock, length)
-        if masked:
-            data = bytes(byte ^ mask[i % 4] for i, byte in enumerate(data))
-        if opcode == 8:
-            return None
-        if opcode == 9:
-            pong = bytes((0x8A, len(data))) + data
-            sock.sendall(pong)
-            continue
-        if opcode == 10:
-            continue
-        if opcode in (1, 0):
-            fragments.append(data)
-            if header[0] & 0x80:
-                return b"".join(fragments).decode("utf-8", errors="replace")
-
-
-def anivox_websocket_profile(profile_id: str, timeout: int = 20) -> dict[str, Any]:
-    host = "anivox.fun"
-    raw_socket = socket.create_connection((host, 443), timeout=timeout)
-    context = ssl.create_default_context()
-    sock = context.wrap_socket(raw_socket, server_hostname=host)
-    sock.settimeout(timeout)
-    key = base64.b64encode(os.urandom(16)).decode("ascii")
-    handshake = (
-        f"GET /api HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        f"Origin: https://{host}\r\n"
-        f"User-Agent: {DEFAULT_USER_AGENT}\r\n\r\n"
-    ).encode("ascii")
-    try:
-        sock.sendall(handshake)
-        response = b""
-        while b"\r\n\r\n" not in response:
-            response += sock.recv(4096)
-            if len(response) > 65536:
-                raise ConnectionError("слишком длинный WebSocket handshake")
-        header_text = response.decode("latin1", errors="replace")
-        status_line = header_text.splitlines()[0] if header_text else ""
-        if " 101 " not in status_line:
-            raise ConnectionError(f"AniVox WebSocket: {status_line}")
-        ws_send_text(sock, {"type": "get_profile", "id": int(profile_id)})
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            message = ws_read_message(sock)
-            if not message:
-                continue
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            if data.get("type") == "get_profile":
-                return data
-        raise TimeoutError("AniVox не прислал ответ get_profile")
-    finally:
+        time.sleep(F2P_FARM_INTERVAL)
         try:
-            sock.close()
-        except OSError:
+            if steam.is_configured() and bot_status["f2p_auto_all_enabled"]:
+                bot_status["last_f2p_check"] = time.strftime("%H:%M:%S")
+                added = steam.add_random_f2p_batch(target_count=8, sequential=True)
+                admin_id = steam.data.get("admin_id")
+                if added and admin_id:
+                    notify_user(admin_id, f"🎮 **Авто-фарм F2P (15 мин): добавлено {len(added)} игр!**\n\n" + "\n".join(added))
+        except Exception:
             pass
 
 
-def format_last_seen(timestamp: float) -> str:
-    if timestamp <= 0:
-        return "Был в сети: время неизвестно"
-    dt = datetime.fromtimestamp(timestamp, tz=almaty_tz())
-    age = max(0, int(time.time() - timestamp))
-    if age < 60:
-        relative = "только что"
-    elif age < 3600:
-        relative = f"{age // 60} мин. назад"
-    elif age < 86400:
-        relative = f"{age // 3600} ч. назад"
-    else:
-        relative = f"{age // 86400} дн. назад"
-    return f"Был в сети: {relative} ({dt.strftime('%H:%M Алматы')})"
-
-
-def result_from_ws(data: dict[str, Any], profile_id: str, url: str) -> FetchResult:
-    if not isinstance(data, dict):
-        return FetchResult(
-            False, profile_id, url, error="AniVox ответил некорректным форматом данных"
-        )
-    container = data.get("data")
-    user = container.get("user") if isinstance(container, dict) else None
-    if not isinstance(user, dict):
-        return FetchResult(
-            False, profile_id, url, error="AniVox ответил без объекта data.user"
-        )
-    online_value = user.get("online", 0)
+def check_giveaways():
+    if not steam.is_configured():
+        return 0
+    claimed = load_json_set(CLAIMED_FILE)
+    bot_status["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    added = 0
     try:
-        online_timestamp = float(online_value or 0)
-    except (TypeError, ValueError):
-        online_timestamp = 0
-    online_status = container.get("online_status", "")
-    if online_timestamp == 0:
-        title = ""
-        if isinstance(online_status, dict):
-            title = compact(online_status.get("text", ""))
-        else:
-            title = compact(online_status)
-        title = re.sub(
-            r"^(?:смотрит|watching)\s*[:：-]?\s*",
-            "",
-            title,
-            flags=re.IGNORECASE,
-        ).strip()
-        presence = f"Смотрит: {title}" if title else "Онлайн"
-    else:
-        title = ""
-        presence = format_last_seen(online_timestamp)
-    return FetchResult(
-        True,
-        profile_id,
-        url,
-        nickname=compact(user.get("username")) or "неизвестно",
-        level=str(user.get("level", "неизвестно")),
-        presence=presence,
-        title=title,
-        last_seen_timestamp=online_timestamp,
-    )
-
-
-def fetch_profile(profile: Profile, timeout: int = 20) -> FetchResult:
-    try:
-        data = anivox_websocket_profile(profile.profile_id, timeout)
-        return result_from_ws(data, profile.profile_id, profile.url)
-    except (ConnectionError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-        return FetchResult(
-            False,
-            profile.profile_id,
-            profile.url,
-            error=f"не удалось получить данные через AniVox WebSocket: {exc}",
-        )
-
-
-def format_profile(result: FetchResult, cache: dict, label: str = "") -> str:
-    name = html.escape(result.nickname + (f" ({label})" if label else ""))
-    lines = [
-        f"<b>👤 Профиль:</b> {name}",
-        f"<b>⭐ Лвл:</b> {html.escape(str(result.level))}",
-    ]
-
-    if result.presence.startswith("Смотрит:"):
-        escaped_title = html.escape(result.title)
-        gnrs, link = get_anime_data(result.title, cache)
-        lines.append(f"🍿 <b>Смотрит:</b> <a href='{link}'>{escaped_title}</a>")
-        if gnrs and gnrs != "-":
-            lines.append(f"🎭 <b>Жанры:</b> {html.escape(gnrs)}")
-    else:
-        status_ico = "🟢" if result.presence.startswith("Онлайн") else "🔴"
-        lines.append(f"{status_ico} <b>Статус:</b> {html.escape(result.presence)}")
-
-    try:
-        dt = datetime.fromisoformat(result.checked_at).strftime("%H:%M")
+        giveaways = requests.get("https://www.gamerpower.com/api/giveaways?platform=steam&type=game", timeout=15).json()
     except Exception:
-        dt = result.checked_at
-
-    lines.extend(
-        [
-            f"<i>⏱ Проверено: {dt} (Алматы)</i>",
-            f"<a href='{result.url}'>🌐 Открыть профиль</a>",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def calc_stats(
-    entries: list[dict], anime_cache: dict
-) -> tuple[float, float, float, dict, dict]:
-    w_time = 0.0
-    on_time = 0.0
-    off_time = 0.0
-    titles: dict[str, float] = {}
-    genres_time: dict[str, float] = {}
-    now = datetime.now(almaty_tz()).timestamp()
-
-    for i in range(len(entries)):
-        curr = entries[i]
-        try:
-            t1 = datetime.fromisoformat(curr["checked_at"]).timestamp()
-            t2 = (
-                datetime.fromisoformat(entries[i + 1]["checked_at"]).timestamp()
-                if i + 1 < len(entries)
-                else now
-            )
-            dur_hours = max(0.0, (t2 - t1) / 3600.0)
-            pres = curr.get("presence", "")
-
-            if "Смотрит" in pres:
-                w_time += dur_hours
-                t = curr.get("title", "Неизвестно")
-                titles[t] = titles.get(t, 0.0) + dur_hours
-
-                cached = anime_cache.get(t)
-                g_list = (
-                    cached.get("genres", [])
-                    if isinstance(cached, dict)
-                    else (cached if isinstance(cached, list) else [])
-                )
-                for genre in g_list:
-                    genres_time[genre] = genres_time.get(genre, 0.0) + dur_hours
-
-            elif "Онлайн" in pres:
-                on_time += dur_hours
-            else:
-                off_time += dur_hours
-        except (ValueError, TypeError):
-            continue
-
-    return round(w_time, 1), round(on_time, 1), round(off_time, 1), titles, genres_time
-
-
-def changed_fields(old: str, result: FetchResult) -> list[str]:
-    if not old:
-        return ["новый профиль"]
-    previous = old.split("|")
-    current = result.signature.split("|")
-    previous += [""] * (4 - len(previous))
-    current += [""] * (4 - len(current))
-    changes: list[str] = []
-    if previous[0] != current[0]:
-        changes.append("ник")
-    if previous[1] != current[1]:
-        changes.append("уровень")
-    old_state, new_state = previous[2], current[2]
-    if old_state != new_state:
-        changes.append("статус")
-    if (
-        old_state.startswith("watching:")
-        and new_state.startswith("watching:")
-        and previous[3] != current[3]
-    ):
-        changes.append("тайтл")
-    return changes
-
-
-# ----------------- ВЕБ-СЕРВЕР И ТИХИЙ АВТО-ПИНГ (АНТИ-СОН) -----------------
-class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    """Обрабатывает /ping для анти-сна и отдает anivox_report.html без лишних логов."""
-
-    def log_message(self, format, *args):
-        pass
-
-    def do_GET(self):
-        parsed_path = urllib.parse.urlparse(self.path).path
-        if parsed_path == "/ping":
-            payload = json.dumps(
-                {
-                    "status": "alive",
-                    "app": APP_NAME,
-                    "version": VERSION,
-                    "ping_count": ping_state["ping_count"],
-                    "last_ping": ping_state["last_ping_time"],
-                },
-                ensure_ascii=False,
-            ).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        if parsed_path == "/" and Path("anivox_report.html").exists():
-            self.path = "/anivox_report.html"
-
-        return super().do_GET()
-
-
-def get_server_port() -> int:
-    try:
-        return int(os.environ.get("PORT", 15887))
-    except ValueError:
-        return 15887
-
-
-def run_web_server(port: Optional[int] = None) -> None:
-    """Запускает веб-сервер в директории со скриптом."""
-    actual_port = port or get_server_port()
-    work_dir = os.path.dirname(os.path.abspath(CONFIG_PATH))
-    os.chdir(work_dir)
-    try:
-        socketserver.TCPServer.allow_reuse_address = True
-        with socketserver.TCPServer(("0.0.0.0", actual_port), QuietHTTPRequestHandler) as httpd:
-            logger.info(f"Web-сервер запущен на порту {actual_port}")
-            httpd.serve_forever()
-    except Exception as e:
-        logger.error(f"Ошибка запуска Web-сервера: {e}")
-
-
-def do_single_ping(store: Store) -> str:
-    """Выполняет один тихий пинг для поддержания активности сервера."""
-    port = get_server_port()
-    base_url = (
-        os.environ.get("RENDER_EXTERNAL_URL")
-        or store.ping_url
-        or f"http://127.0.0.1:{port}"
-    ).rstrip("/")
-    ping_url = base_url if base_url.endswith("/ping") else f"{base_url}/ping"
-
-    # Дополнительно пингуем локальный сокет на случай внешнего файрвола
-    local_url = f"http://127.0.0.1:{port}/ping"
-    t0 = time.monotonic()
-    now_str = datetime.now(almaty_tz()).strftime("%H:%M:%S")
-    try:
-        req = urllib.request.Request(ping_url, headers={"User-Agent": DEFAULT_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            code = resp.getcode()
-        ms = int((time.monotonic() - t0) * 1000)
-        ping_state["last_ping_ts"] = time.time()
-        ping_state["last_ping_time"] = now_str
-        ping_state["last_ping_code"] = f"HTTP {code} ({ms} мс)"
-        ping_state["ping_count"] += 1
-        ping_state["ping_history"].append(f"• {now_str} — ✅ HTTP {code} ({ms} мс)")
-    except Exception:
-        try:
-            req_loc = urllib.request.Request(local_url, headers={"User-Agent": DEFAULT_USER_AGENT})
-            with urllib.request.urlopen(req_loc, timeout=5) as resp_loc:
-                code = resp_loc.getcode()
-            ms = int((time.monotonic() - t0) * 1000)
-            ping_state["last_ping_ts"] = time.time()
-            ping_state["last_ping_time"] = now_str
-            ping_state["last_ping_code"] = f"Local HTTP {code} ({ms} мс)"
-            ping_state["ping_count"] += 1
-            ping_state["ping_history"].append(f"• {now_str} — 🟢 Local {code} ({ms} мс)")
-        except Exception as exc:
-            ping_state["last_ping_ts"] = time.time()
-            ping_state["last_ping_time"] = now_str
-            ping_state["last_ping_code"] = f"Ошибка ({exc})"
-            ping_state["ping_history"].append(f"• {now_str} — ❌ Ошибка сети")
-
-    if len(ping_state["ping_history"]) > 10:
-        ping_state["ping_history"] = ping_state["ping_history"][-10:]
-    return ping_state["last_ping_code"]
-
-
-def run_keep_alive_pinger(store: Store, stop_event: threading.Event) -> None:
-    """Фоновый поток тихого авто-пинга каждые 3-5 минут, чтобы бот никогда не выключался."""
-    stop_event.wait(10)
-    if not stop_event.is_set():
-        do_single_ping(store)
-    while not stop_event.is_set():
-        base_sec = max(60, int(ping_state.get("ping_interval_min", 4)) * 60)
-        wait_sec = max(60, base_sec + random.randint(-30, 30))
-        stop_event.wait(wait_sec)
-        if not stop_event.is_set():
-            do_single_ping(store)
-
-
-class Monitor:
-    def __init__(self, store: Store, telegram: TelegramClient) -> None:
-        self.store = store
-        self.telegram = telegram
-        self.stop_event = threading.Event()
-        self.paused = False
-        self.check_lock = threading.RLock()
-        self.check_requested = threading.Event()
-        self.bridge_chat_active: bool = False
-        self.bridge_chat_initiator: str = ""
-        self.chat_lock = threading.Lock()
-
-    def stop(self, *_args: Any) -> None:
-        self.stop_event.set()
-
-    def start_bridge_chat(self, sender_id: str, sender_name: str) -> None:
-        with self.chat_lock:
-            self.bridge_chat_active = True
-            self.bridge_chat_initiator = f"{sender_name} (ID: {sender_id})"
-
-        announcement = (
-            "🚨 <b>ПРИНУДИТЕЛЬНЫЙ ОБЩИЙ ЧАТ АКТИВИРОВАН!</b>\n\n"
-            f"👤 <b>Инициатор:</b> {html.escape(str(sender_name))} (ID: <code>{sender_id}</code>)\n"
-            f"👥 <b>Связано участников:</b> {len(self.store.allowed_users)}\n\n"
-            "⚡️ Чат начался <b>сразу у всех</b> (владелец и все друзья объединены в прямой мост)!\n"
-            "💬 Любое сообщение, которое вы напишете сюда, моментально увидят все остальные.\n\n"
-            "<i>Для выхода и закрытия моста нажмите кнопку «🚪 Завершить чат».</i>"
-        )
-        for uid in self.store.allowed_users:
+        return 0
+    for g in giveaways:
+        gid = str(g.get("id"))
+        open_url = g.get("open_giveaway_url", "")
+        if gid not in claimed and "store.steampowered.com/app/" in open_url:
             try:
-                self.telegram.send_message(uid, announcement, reply_markup=TELEGRAM_KEYBOARD)
-            except Exception as exc:
-                logger.warning("Ошибка отправки старта чата для %s: %s", uid, exc)
-
-    def stop_bridge_chat(self, sender_id: str, sender_name: str) -> None:
-        with self.chat_lock:
-            if not self.bridge_chat_active:
-                try:
-                    self.telegram.send_message(sender_id, "ℹ️ Общий чат в данный момент не активен.")
-                except Exception:
-                    pass
-                return
-            self.bridge_chat_active = False
-
-        closing_msg = (
-            "🛑 <b>ОБЩИЙ ЧАТ ЗАВЕРШЁН</b>\n\n"
-            f"👤 Завершил: <b>{html.escape(str(sender_name))}</b> (ID: <code>{sender_id}</code>)\n"
-            "Мост связи отключен для всех. Бот вернулся в стандартный режим отслеживания профилей."
-        )
-        for uid in self.store.allowed_users:
-            try:
-                self.telegram.send_message(uid, closing_msg, reply_markup=TELEGRAM_KEYBOARD)
-            except Exception as exc:
-                logger.warning("Ошибка отправки завершения чата для %s: %s", uid, exc)
-
-    def relay_bridge_message(self, sender_id: str, sender_name: str, text: str) -> None:
-        formatted_msg = (
-            f"💬 <b>[{html.escape(str(sender_name))}]:</b>\n"
-            f"{html.escape(text)}"
-        )
-        for uid in self.store.allowed_users:
-            if str(uid) != str(sender_id):
-                try:
-                    self.telegram.send_message(uid, formatted_msg)
-                except Exception as exc:
-                    logger.warning("Не удалось переслать сообщение в чат для %s: %s", uid, exc)
-
-    def allowed_notification(self, old: str, result: FetchResult) -> bool:
-        settings = self.store.settings
-        fields = changed_fields(old, result)
-        if not old or not settings.notify_on_change:
-            return bool(not old and settings.notify_on_change)
-        if "статус" in fields:
-            online = result.presence.startswith(("Онлайн", "Смотрит"))
-            if online and not settings.notify_on_online:
-                fields.remove("статус")
-            if not online and not settings.notify_on_offline:
-                fields.remove("статус")
-        if "тайтл" in fields and not settings.notify_on_title:
-            fields.remove("тайтл")
-        return bool(fields)
-
-    def check_one(self, profile: Profile, announce: bool) -> FetchResult:
-        result = fetch_profile(profile, self.store.settings.request_timeout)
-
-        with self.check_lock:
-            profile.last_check = result.checked_at
-            old_signature = profile.last_signature
-            changes = changed_fields(old_signature, result)
-            profile.last_ok = result.ok
-            profile.last_error = result.error
-            self.store.add_history(profile.profile_id, result, changes)
-
-            if result.ok:
-                if announce and self.allowed_notification(old_signature, result):
-                    prefix = ""
-                    if old_signature:
-                        prefix = "<b>🔔 Изменение:</b> " + ", ".join(changes) + "\n\n"
-                    msg_text = prefix + format_profile(
-                        result, self.store.anime_cache, profile.label
-                    )
-
-                    for uid in self.store.allowed_users:
-                        try:
-                            self.telegram.send_message(uid, msg_text)
-                        except TelegramError as exc:
-                            logger.warning("Telegram notification failed for %s: %s", uid, exc)
-
-                profile.last_signature = result.signature
-                profile.last_status = result.presence
-
-            elif announce and self.store.settings.notify_on_errors:
-                err_msg = (
-                    f"⚠️ <b>Ошибка проверки {html.escape(profile.url)}</b>\n"
-                    f"{html.escape(result.error)}"
-                )
-                for uid in self.store.allowed_users:
-                    try:
-                        self.telegram.send_message(uid, err_msg)
-                    except TelegramError as exc:
-                        logger.warning("Telegram error notification failed for %s: %s", uid, exc)
-            self.store.save()
-            return result
-
-    def check_all(self, announce: bool = True) -> list[FetchResult]:
-        results = []
-        for profile in list(self.store.profiles.values()):
-            if self.stop_event.is_set():
-                break
-            results.append(self.check_one(profile, announce))
-        return results
-
-    def watching_now_text(self) -> str:
-        """Новая функция: показывает всех, кто прямо сейчас Онлайн или Смотрит аниме."""
-        if not self.store.profiles:
-            return "Список профилей пуст."
-        active_rows: list[str] = []
-        for p in self.store.profiles.values():
-            st = p.last_status or ""
-            nick = (p.last_signature.split("|")[0].capitalize() if p.last_signature else "") or p.label or p.profile_id
-            if st.startswith("Смотрит:"):
-                title = st.replace("Смотрит:", "").strip()
-                gnrs, link = get_anime_data(title, self.store.anime_cache)
-                active_rows.append(
-                    f"🍿 <b>{html.escape(nick)}</b> (ID <code>{p.profile_id}</code>)\n"
-                    f"  └ Смотрит: <a href='{link}'>{html.escape(title)}</a> ({html.escape(gnrs)})"
-                )
-            elif st.startswith("Онлайн"):
-                active_rows.append(
-                    f"🟢 <b>{html.escape(nick)}</b> (ID <code>{p.profile_id}</code>) — <b>В сети (Онлайн)</b>"
-                )
-        if not active_rows:
-            return "😴 Прямо сейчас никто из отслеживаемых профилей не смотрит аниме и не находится в сети."
-        return "🍿 <b>Сейчас онлайн / смотрят аниме:</b>\n\n" + "\n\n".join(active_rows)
-
-    def top_activity_text(self) -> str:
-        """Новая функция: рейтинг всех профилей по часам просмотра аниме и уровню."""
-        if not self.store.profiles:
-            return "Список профилей пуст."
-        stats_list = []
-        for pid, p in self.store.profiles.items():
-            entries = self.store.history.get(pid, [])
-            w_h, on_h, _, titles, _ = calc_stats(entries, self.store.anime_cache)
-            parts = p.last_signature.split("|") if p.last_signature else []
-            nick = (parts[0].capitalize() if parts and parts[0] else "") or p.label or pid
-            lvl_str = parts[1] if len(parts) > 1 else "?"
-            try:
-                lvl_num = int(re.sub(r"\D", "", lvl_str) or "0")
-            except ValueError:
-                lvl_num = 0
-            fav_title = max(titles.items(), key=lambda x: x[1])[0] if titles else "—"
-            stats_list.append((w_h + on_h, w_h, on_h, lvl_num, nick, pid, fav_title))
-
-        stats_list.sort(key=lambda x: (x[1], x[3]), reverse=True)
-        rows = ["🏆 <b>Рейтинг активности профилей AniVox:</b>\n"]
-        medals = ["🥇", "🥈", "🥉"]
-        for i, (_, w_h, on_h, lvl_num, nick, pid, fav) in enumerate(stats_list, 1):
-            m = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
-            rows.append(
-                f"{m} <b>{html.escape(nick)}</b> (ID <code>{pid}</code>) — ⭐ Лвл: <b>{lvl_num}</b>\n"
-                f"   🍿 В аниме: <b>{w_h} ч.</b> | 🟢 Онлайн: <b>{on_h} ч.</b>\n"
-                f"   ❤️ Фаворит: <i>{html.escape(fav[:35])}</i>"
-            )
-        return "\n\n".join(rows)[:4000]
-
-    def inspect_link_message(self, chat_id: str, is_owner: bool, text: str) -> bool:
-        """Новая функция: мгновенный разбор ссылок на профиль или аниме прямо из чата."""
-        # 1. Проверяем ссылку на профиль AniVox
-        try:
-            url, pid = normalize_profile_url(text)
-            res = fetch_profile(Profile(url=url, profile_id=pid), self.store.settings.request_timeout)
-            if not res.ok:
-                self.telegram.send_message(chat_id, f"❌ Не удалось загрузить профиль <code>{pid}</code>:\n{html.escape(res.error)}")
-                return True
-            in_list = pid in self.store.profiles
-            kb = None
-            if is_owner and not in_list:
-                kb = {
-                    "inline_keyboard": [
-                        [{"text": f"➕ Добавить профиль {pid} в мониторинг", "callback_data": f"quick_add_{pid}"}]
-                    ]
-                }
-            caption = "🔍 <b>Быстрый просмотр профиля по ссылке:</b>\n\n" + format_profile(res, self.store.anime_cache)
-            self.telegram.send_message(chat_id, caption, reply_markup=kb)
-            return True
-        except ValueError:
-            pass
-
-        # 2. Проверяем ссылку на аниме (anivox.fun/anime/ID или shikimori.one/animes/ID)
-        m_anime = ANIME_LINK_RE.search(text)
-        if m_anime:
-            aid = m_anime.group(1)
-            info = fetch_anime_details_by_id(aid)
-            if not info:
-                self.telegram.send_message(chat_id, f"❌ Не удалось найти информацию об аниме ID <code>{aid}</code>.")
-                return True
-            msg = (
-                f"🎬 <b>{html.escape(info['name_ru'])}</b>\n"
-                f"<i>({html.escape(info['name_en'])})</i>\n\n"
-                f"⭐ <b>Рейтинг:</b> {html.escape(str(info['score']))}\n"
-                f"📺 <b>Эпизоды:</b> {html.escape(str(info['episodes']))} (Статус: {html.escape(str(info['status']))})\n"
-                f"🎭 <b>Жанры:</b> {html.escape(info['genres'])}\n\n"
-                f"🍿 <a href='{info['link']}'>Открыть в AniVox (ID {info['id']})</a>"
-            )
-            self.telegram.send_message(chat_id, msg)
-            return True
-
-        return False
-
-    def send_ping_menu(self, chat_id: str, message_id: Optional[int] = None) -> None:
-        uptime_min = int((time.time() - ping_state["start_time"]) // 60)
-        if ping_state["last_ping_ts"] > 0:
-            sec_ago = int(time.time() - ping_state["last_ping_ts"])
-            ago_str = f"{sec_ago // 60} мин. {sec_ago % 60} сек. назад"
-        else:
-            ago_str = "ожидание первого пинга..."
-
-        history_str = "\n".join(ping_state["ping_history"][-8:]) or "<i>Пока нет записей</i>"
-        kb = {
-            "inline_keyboard": [
-                [
-                    {"text": "🔄 Обновить", "callback_data": "ping_refresh"},
-                    {"text": "⚡ Пингануть сейчас", "callback_data": "ping_now"},
-                ],
-                [
-                    {"text": "⏱ 3-5 мин (По умолч.)", "callback_data": "ping_int_4"},
-                    {"text": "⏱ 10 мин", "callback_data": "ping_int_10"},
-                ],
-            ]
-        }
-        text = (
-            f"📡 <b>Анти-Сон и Авто-Пинг сервера</b>\n\n"
-            f"🟢 <b>Аптайм бота:</b> {uptime_min} мин.\n"
-            f"🌐 <b>Ссылка пинга:</b> <code>{html.escape(self.store.ping_url)}/ping</code>\n"
-            f"⏱ <b>Интервал:</b> каждые ~{ping_state['ping_interval_min']} мин.\n"
-            f"🕒 <b>Последний пинг:</b> {ago_str} ({html.escape(ping_state['last_ping_code'])})\n"
-            f"📊 <b>Всего пингов:</b> {ping_state['ping_count']}\n\n"
-            f"📜 <b>Последние пинги (тихий лог):</b>\n{history_str}\n\n"
-            f"<i>Чтобы привязать новую ссылку для пинга, отправьте:</i>\n"
-            f"<code>/setping https://ваш-проект.onrender.com</code>"
-        )
-        if message_id:
-            self.telegram.edit_message_text(chat_id, text, message_id, kb)
-        else:
-            self.telegram.send_message(chat_id, text, kb)
-
-    def history_text(self, args: str) -> str:
-        parts = args.split()
-        profile_id = parts[0] if parts and parts[0].isdigit() else ""
-        try:
-            limit = int(parts[1] if profile_id and len(parts) > 1 else parts[0]) if parts else 15
-        except ValueError:
-            limit = 15
-        limit = max(1, min(30, limit))
-        profile_ids = [profile_id] if profile_id else list(self.store.profiles)
-        blocks: list[str] = []
-
-        p_idx = 1
-        for current_id in profile_ids:
-            profile = self.store.profiles.get(current_id)
-            entries = self.store.history.get(current_id, [])
-            title = profile.label if profile and profile.label else current_id
-
-            try:
-                last_chk_str = (
-                    datetime.fromisoformat(profile.last_check).strftime("%d.%m %H:%M:%S")
-                    if profile and profile.last_check
-                    else "никогда"
-                )
-            except Exception:
-                last_chk_str = profile.last_check if profile and profile.last_check else "никогда"
-
-            rows = [
-                f"👤 <b>{p_idx}. {html.escape(title)}</b> (ID {current_id})",
-                f"🔄 <i>Автопроверка: {html.escape(last_chk_str)}</i>",
-            ]
-
-            if not entries:
-                rows.append("<i>История пуста</i>")
-            else:
-                hist_idx = 1
-                for entry in entries[-limit:][::-1]:
-                    status = entry.get("presence", "неизвестно")
-                    try:
-                        dt_str = datetime.fromisoformat(entry.get("checked_at", "")).strftime("%d.%m %H:%M")
-                    except Exception:
-                        dt_str = entry.get("checked_at", "?")
-
-                    rows.append(f"<b>{hist_idx}.</b> {dt_str} — {html.escape(status)}")
-                    hist_idx += 1
-
-            blocks.append("\n".join(rows))
-            p_idx += 1
-
-        return (
-            "\n\n".join(blocks)[:4000]
-            if blocks
-            else "История пока пуста. Записываются только изменения."
-        )
-
-    def summary_text(self) -> str:
-        if not self.store.profiles:
-            return "Профилей нет. Владелец должен добавить профиль через /add."
-        counts = {"онлайн": 0, "смотрит": 0, "оффлайн": 0, "ошибка": 0}
-        rows = ["🧾 <b>Сводка по пользователям:</b>"]
-
-        idx = 1
-        for profile in self.store.profiles.values():
-            status = profile.last_status or "не проверялся"
-            status_lower = status.lower()
-            if not profile.last_ok and profile.last_check:
-                counts["ошибка"] += 1
-            elif status_lower.startswith("смотрит"):
-                counts["смотрит"] += 1
-            elif status_lower.startswith("онлайн"):
-                counts["онлайн"] += 1
-            elif profile.last_check:
-                counts["оффлайн"] += 1
-            history_count = len(self.store.history.get(profile.profile_id, []))
-
-            try:
-                dt_str = (
-                    datetime.fromisoformat(profile.last_check).strftime("%d.%m %H:%M")
-                    if profile.last_check
-                    else "нет"
-                )
-            except Exception:
-                dt_str = profile.last_check
-
-            rows.append(
-                f"<b>{idx}.</b> {html.escape(profile.label or profile.profile_id)}: {html.escape(status)}\n"
-                f"  изменений: {history_count}, последнее: {dt_str}"
-            )
-            idx += 1
-
-        rows.append(
-            "\nИтого: "
-            f"🟢 онлайн {counts['онлайн']} | "
-            f"🍿 смотрит {counts['смотрит']} | "
-            f"🔴 оффлайн {counts['оффлайн']} | "
-            f"⚠️ ошибки {counts['ошибка']}"
-        )
-        return "\n".join(rows)[:4000]
-
-    def search_text(self, query: str) -> str:
-        needle = query.strip().lower()
-        if not needle:
-            return "Пример: /find текст или нажмите 🔍 Поиск."
-        found: list[str] = []
-        for profile in self.store.profiles.values():
-            entries = self.store.history.get(profile.profile_id, [])
-            latest = entries[-1] if entries else {}
-            haystack = " ".join(
-                [
-                    profile.profile_id,
-                    profile.label,
-                    str(latest.get("nickname", "")),
-                    str(latest.get("title", "")),
-                ]
-            ).lower()
-            if needle in haystack:
-                found.append(
-                    f"• {html.escape(latest.get('nickname', profile.label or profile.profile_id))} "
-                    f"(ID {profile.profile_id}) — {html.escape(latest.get('presence', 'не проверялся'))}"
-                )
-        return "\n".join(["Найдено:"] + found) if found else "Ничего не найдено."
-
-    def probe_text(self) -> str:
-        if self.store.profiles:
-            profile = next(iter(self.store.profiles.values()))
-        else:
-            profile = Profile("https://anivox.fun/profile/27788", "27788")
-        started = time.monotonic()
-        result = fetch_profile(profile, self.store.settings.request_timeout)
-        elapsed = time.monotonic() - started
-        if result.ok:
-            return (
-                f"✅ AniVox доступен, WebSocket /api работает.\n"
-                f"Ответ за {elapsed:.1f} сек.\n{format_profile(result, self.store.anime_cache)}"
-            )
-        return f"❌ AniVox не ответил за {elapsed:.1f} сек.\n{html.escape(result.error)}"
-
-    def export_history(self, chat_id: str) -> str:
-        path = CONFIG_PATH.with_name("anivox_history_export.json")
-        payload = {
-            "exported_at": almaty_now(),
-            "profiles": [asdict(profile) for profile in self.store.profiles.values()],
-            "history": self.store.history,
-        }
-        save_json(path, payload)
-        try:
-            self.telegram.send_document(chat_id, path, "История AniVox (JSON)")
-            return "Экспорт истории отправлен файлом."
-        except TelegramError as exc:
-            return f"Не удалось отправить экспорт: {exc}"
-
-    def generate_html_report(self, chat_id: Optional[str] = None) -> None:
-        path = CONFIG_PATH.with_name("anivox_report.html")
-        html_doc = [
-            "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>",
-            "<meta http-equiv='refresh' content='30'>",
-            "<title>AniVox Dashboard</title><script src='https://cdn.jsdelivr.net/npm/chart.js'></script>",
-            "<style>",
-            ":root { --bg: #f4f6f9; --card: #ffffff; --text: #333; --border: #e0e0e0; --primary: #007bff; --hover: #f1f1f1; --accent: #e3f2fd; }",
-            "@media (prefers-color-scheme: dark) { :root { --bg: #121212; --card: #1e1e1e; --text: #e0e0e0; --border: #333; --primary: #bb86fc; --hover: #2c2c2c; --accent: #2c2c2c; } }",
-            "body{font-family:'Segoe UI',sans-serif; background:var(--bg); color:var(--text); margin:0; padding:20px; transition: 0.3s;}",
-            "h2{text-align:center; font-size:26px;}",
-            ".container { display: flex; flex-direction: column; max-width: 1000px; margin: 0 auto; }",
-            ".tabs { display: flex; flex-wrap: wrap; background: var(--card); border-radius: 12px 12px 0 0; border: 1px solid var(--border); border-bottom: none; }",
-            ".tabs button { flex: 1; min-width: 120px; background: inherit; color: var(--text); border: none; padding: 15px; cursor: pointer; font-weight: bold; transition: 0.3s; }",
-            ".tabs button:hover { background: var(--hover); }",
-            ".tabs button.active { border-bottom: 3px solid var(--primary); color: var(--primary); }",
-            ".tabcontent { display: none; background: var(--card); padding: 25px; border: 1px solid var(--border); border-radius: 0 0 12px 12px; animation: fade 0.4s; }",
-            "@keyframes fade { from {opacity: 0;} to {opacity: 1;} }",
-            ".stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }",
-            ".card { background: var(--accent); padding: 20px; border-radius: 10px; text-align: center; border: 1px solid var(--border); font-size: 16px; }",
-            ".card span { display: block; font-size: 24px; font-weight: bold; color: var(--primary); margin-top: 5px; }",
-            ".charts { display: flex; flex-wrap: wrap; gap: 20px; justify-content: space-around; margin-bottom: 20px; }",
-            ".chart-box { width: 300px; max-width: 100%; }",
-            "table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }",
-            "th, td { border: 1px solid var(--border); padding: 10px; text-align: left; }",
-            "th { background: var(--primary); color: #fff; }",
-            ".history-table th, .history-table td { padding: 8px; font-size: 13px; border: 1px solid var(--border); }",
-            "a { color: var(--primary); text-decoration: none; } a:hover { text-decoration: underline; }",
-            "</style></head><body>",
-            "<div class='container'><h2>🌌 AniVox Dashboard</h2><div class='tabs'>",
-        ]
-
-        tab_idx = 1
-        for pid, p in self.store.profiles.items():
-            name = (p.last_signature.split("|")[0].capitalize() if p.last_signature else "") or p.label or pid
-            html_doc.append(f"<button class='tablinks' onclick=\"openTab('id_{pid}')\">{tab_idx}. {html.escape(name)}</button>")
-            tab_idx += 1
-        html_doc.append("</div>")
-
-        tab_idx = 1
-        for pid, p in self.store.profiles.items():
-            name = (p.last_signature.split("|")[0].capitalize() if p.last_signature else "") or p.label or pid
-            entries = self.store.history.get(pid, [])
-            w_h, on_h, off_h, titles, genres_time = calc_stats(entries, self.store.anime_cache)
-
-            html_doc.append(f"<div id='id_{pid}' class='tabcontent'>")
-            html_doc.append(f"<h3>👤 {tab_idx}. {html.escape(name)}</h3>")
-            html_doc.append("<div class='stats-grid'>")
-            html_doc.append(f"<div class='card'>В аниме <span>{w_h} ч.</span></div>")
-            html_doc.append(f"<div class='card'>Онлайн <span>{on_h} ч.</span></div>")
-            html_doc.append(f"<div class='card'>Оффлайн <span>{off_h} ч.</span></div>")
-            html_doc.append("</div>")
-
-            html_doc.append("<div class='charts'>")
-            if w_h > 0 or on_h > 0 or off_h > 0:
-                html_doc.append(f"<div class='chart-box'><canvas id='c1_{pid}'></canvas></div>")
-                html_doc.append(f"<script>try{{new Chart(document.getElementById('c1_{pid}'), {{type:'doughnut', data:{{labels:['Смотрит','Онлайн','Оффлайн'], datasets:[{{data:[{w_h},{on_h},{off_h}], backgroundColor:['#bb86fc','#03dac6','#cf6679']}}]}}, options:{{plugins:{{legend:{{position:'bottom'}}}}}} }});}}catch(e){{}}</script>")
-
-            if genres_time:
-                g_lbls = [f"'{g}'" for g, _ in sorted(genres_time.items(), key=lambda x: x[1], reverse=True)[:6]]
-                g_data = [str(round(v, 1)) for _, v in sorted(genres_time.items(), key=lambda x: x[1], reverse=True)[:6]]
-                html_doc.append(f"<div class='chart-box'><canvas id='c2_{pid}'></canvas></div>")
-                html_doc.append(f"<script>try{{new Chart(document.getElementById('c2_{pid}'), {{type:'polarArea', data:{{labels:[{','.join(g_lbls)}], datasets:[{{label:'Часов', data:[{','.join(g_data)}], backgroundColor:'rgba(187, 134, 252, 0.5)'}}]}}, options:{{plugins:{{legend:{{position:'bottom'}}}}, scales:{{r:{{ticks:{{display:false}}}}}} }} }});}}catch(e){{}}</script>")
-            html_doc.append("</div>")
-
-            if titles:
-                html_doc.append("<h4>🏆 Топ тайтлов:</h4><table><tr><th>Тайтл</th><th>Жанры</th><th>Часы</th></tr>")
-                for t, hrs in sorted(titles.items(), key=lambda x: x[1], reverse=True):
-                    gnrs, link = get_anime_data(t, self.store.anime_cache)
-                    html_doc.append(f"<tr><td><a href='{link}' target='_blank'>{html.escape(t)}</a></td><td><small>{html.escape(gnrs)}</small></td><td><b>{round(hrs,1)}</b></td></tr>")
-                html_doc.append("</table><br>")
-
-            if entries:
-                html_doc.append("<h4>📈 История (до 50):</h4><table class='history-table'><tr><th>#</th><th>Дата (Алматы)</th><th>Статус</th></tr>")
-                hist_idx = 1
-                for e in reversed(entries[-50:]):
-                    try:
-                        dt_str = datetime.fromisoformat(e.get("checked_at", "")).strftime("%d.%m %H:%M")
-                    except Exception:
-                        dt_str = e.get("checked_at", "")
-
-                    presence = str(e.get("presence", ""))
-                    if presence.startswith("Смотрит:"):
-                        title_part = presence.replace("Смотрит: ", "").strip()
-                        _, link = get_anime_data(title_part, self.store.anime_cache)
-                        presence_html = f"Смотрит: <a href='{link}' target='_blank'>{html.escape(title_part)}</a>"
-                    else:
-                        presence_html = html.escape(presence)
-
-                    html_doc.append(f"<tr><td>{hist_idx}</td><td>{dt_str}</td><td>{presence_html}</td></tr>")
-                    hist_idx += 1
-                html_doc.append("</table>")
-
-            html_doc.append("</div>")
-            tab_idx += 1
-
-        html_doc.extend(
-            [
-                "<script>",
-                "function openTab(id) {",
-                "  try {",
-                "    var t = document.getElementsByClassName('tabcontent');",
-                "    for(var i=0;i<t.length;i++) t[i].style.display='none';",
-                "    var l = document.getElementsByClassName('tablinks');",
-                "    for(var i=0;i<l.length;i++) l[i].className = l[i].className.replace(' active','');",
-                "    var content = document.getElementById(id);",
-                "    if(content) content.style.display='block';",
-                "    var btn = document.querySelector(\"button[onclick=\\\"openTab('\" + id + \"')\\\"]\");",
-                "    if(btn) btn.className += ' active';",
-                "    sessionStorage.setItem('activeTab_anivox', id);",
-                "  } catch(err) {}",
-                "}",
-                "window.addEventListener('beforeunload', function() { sessionStorage.setItem('scrollPos_anivox', window.scrollY); });",
-                "document.addEventListener('DOMContentLoaded', function() {",
-                "  try {",
-                "    var activeId = sessionStorage.getItem('activeTab_anivox');",
-                "    if (activeId && document.getElementById(activeId)) { openTab(activeId); }",
-                "    else {",
-                "      var firstBtn = document.getElementsByClassName('tablinks')[0];",
-                "      if(firstBtn) { var m = firstBtn.getAttribute('onclick').match(/'([^']+)'/); if(m) openTab(m[1]); }",
-                "    }",
-                "    var sp = sessionStorage.getItem('scrollPos_anivox');",
-                "    if (sp) window.scrollTo(0, parseInt(sp));",
-                "  } catch(err) {}",
-                "});",
-                "</script></div></body></html>",
-            ]
-        )
-
-        path.write_text("\n".join(html_doc), encoding="utf-8")
-
-        if chat_id:
-            try:
-                site_link = f"{self.store.ping_url.rstrip('/')}/anivox_report.html"
-                self.telegram.send_document(
-                    chat_id,
-                    path,
-                    caption=f"🌐 Нейро-Отчет обновлен! Вы можете открыть этот файл или перейти по ссылке: {site_link}",
-                )
-            except Exception as exc:
-                self.telegram.send_message(chat_id, f"❌ Ошибка отправки отчета: {exc}")
-
-    def enforce_cleanup(self) -> None:
-        days = self.store.settings.auto_cleanup_days
-        if days <= 0:
-            return
-        cutoff = time.time() - (days * 86400)
-        for profile_id, entries in self.store.history.items():
-            cleaned = []
-            for entry in entries:
-                try:
-                    when = datetime.fromisoformat(entry.get("checked_at", "")).timestamp()
-                except (TypeError, ValueError):
-                    when = time.time()
-                if when >= cutoff:
-                    cleaned.append(entry)
-            self.store.history[profile_id] = cleaned
-        self.store.save()
-
-    def cleanup_history(self, args: str) -> str:
-        try:
-            days = max(1, min(3650, int(args or "30")))
-        except ValueError:
-            return "Пример: /cleanup 30"
-        cutoff = time.time() - days * 86400
-        removed = 0
-        for profile_id, entries in list(self.store.history.items()):
-            kept: list[dict[str, Any]] = []
-            for entry in entries:
-                try:
-                    when = datetime.fromisoformat(entry.get("checked_at", "")).timestamp()
-                except (TypeError, ValueError):
-                    when = time.time()
-                if when >= cutoff:
-                    kept.append(entry)
-                else:
-                    removed += 1
-            self.store.history[profile_id] = kept
-        self.store.save()
-        return f"Удалено записей старше {days} дн.: {removed}."
-
-    def send_settings_menu(self, chat_id: str, message_id: Optional[int] = None) -> None:
-        if chat_id != self.store.chat_id:
-            self.telegram.send_message(chat_id, "❌ Настройки может менять только владелец бота.")
-            return
-
-        s = self.store.settings
-        kb = {
-            "inline_keyboard": [
-                [{"text": f"⏱ Интервал: {s.interval_minutes} мин", "callback_data": "ignore"}],
-                [
-                    {"text": "1", "callback_data": "set_int_1"},
-                    {"text": "5", "callback_data": "set_int_5"},
-                    {"text": "10", "callback_data": "set_int_10"},
-                    {"text": "30", "callback_data": "set_int_30"},
-                ],
-                [{"text": f"🧹 Очистка истории: {s.auto_cleanup_days} дн.", "callback_data": "ignore"}],
-                [
-                    {"text": "5 дн", "callback_data": "set_cln_5"},
-                    {"text": "15 дн", "callback_data": "set_cln_15"},
-                    {"text": "30 дн", "callback_data": "set_cln_30"},
-                    {"text": "Выкл", "callback_data": "set_cln_0"},
-                ],
-            ]
-        }
-        text = "⚙️ <b>Панель управления (Владелец)</b>\nМеняйте параметры в один клик:"
-        if message_id:
-            self.telegram.edit_message_text(chat_id, text, message_id, kb)
-        else:
-            self.telegram.send_message(chat_id, text, kb)
-
-    def send_notifications_menu(self, chat_id: str, message_id: Optional[int] = None) -> None:
-        if chat_id != self.store.chat_id:
-            self.telegram.send_message(chat_id, "❌ Настройки уведомлений может менять только владелец.")
-            return
-
-        s = self.store.settings
-        kb = {
-            "inline_keyboard": [
-                [
-                    {"text": f"{'✅' if s.notify_on_online else '❌'} Онлайн", "callback_data": "ntf_onl"},
-                    {"text": f"{'✅' if s.notify_on_offline else '❌'} Оффлайн", "callback_data": "ntf_off"},
-                ],
-                [
-                    {"text": f"{'✅' if s.notify_on_title else '❌'} Смена тайтла", "callback_data": "ntf_ttl"},
-                    {"text": f"{'✅' if s.notify_on_errors else '❌'} Ошибки", "callback_data": "ntf_err"},
-                ],
-                [
-                    {
-                        "text": f"{'🔔' if s.notify_on_change else '🔕'} ГЛАВНЫЙ РУБИЛЬНИК ({'ВКЛ' if s.notify_on_change else 'ВЫКЛ'})",
-                        "callback_data": "ntf_all",
-                    }
-                ],
-            ]
-        }
-        text = "🔕 <b>Настройка уведомлений</b>\nВыберите, о чем бот должен вам писать:"
-        if message_id:
-            self.telegram.edit_message_text(chat_id, text, message_id, kb)
-        else:
-            self.telegram.send_message(chat_id, text, kb)
-
-    def command(self, chat_id: str, is_owner: bool, command: str, args: str) -> str:
-        if command in {"/start", "/help"}:
-            return (
-                f"<b>AniVox Monitor v{VERSION}</b>\n\n"
-                "<code>/add &lt;ссылка&gt; [метка]</code> — добавить профиль\n"
-                "<code>/list</code> — список профилей\n"
-                "<code>/remove &lt;id&gt;</code> — удалить профиль\n"
-                "<code>/check [id|all]</code> — принудительная проверка\n"
-                "<code>/watching</code> — кто сейчас онлайн / смотрит аниме\n"
-                "<code>/top</code> — топ активности и уровней профилей\n"
-                "<code>/random</code> — случайное популярное аниме со ссылкой\n"
-                "<code>/history [id] [кол-во]</code> — показать историю\n"
-                "<code>/report</code> (или /site) — сгенерировать HTML-отчет\n"
-                "<code>/find &lt;текст&gt;</code> — поиск в истории\n"
-                "<code>/pingstatus</code> — статус авто-пинга сервера\n"
-                "<code>/setping &lt;ссылка&gt;</code> — задать ссылку для авто-пинга\n"
-                "<code>/settings</code> — меню настроек\n"
-                "<code>/notifications</code> — настройка уведомлений\n"
-                "<code>/friends</code> — управление друзьями\n"
-                "<code>/chat</code> — принудительно связать всех в общий чат\n"
-                "<code>/stopchat</code> — завершить общий чат для всех\n\n"
-                "💡 <i>Также вы можете просто отправить в чат любую ссылку на профиль или аниме AniVox/Shikimori для мгновенного разбора!</i>"
-            )
-        if command == "/list":
-            if not self.store.profiles:
-                return "Профилей нет. Владелец должен добавить их через /add."
-            idx = 1
-            out = ["<b>Мои профили:</b>"]
-            for p in self.store.profiles.values():
-                out.append(
-                    f"<b>{idx}.</b> <code>{p.profile_id}</code> — {html.escape(p.label or p.url)} — {html.escape(p.last_status or 'не проверялся')}"
-                )
-                idx += 1
-            return "\n".join(out)
-        if command == "/add":
-            if not is_owner:
-                return "Добавлять профили может только владелец."
-            parts = args.split(maxsplit=1)
-            if not parts:
-                return "Пример: /add https://anivox.fun/profile/27788 метка"
-            try:
-                url, profile_id = normalize_profile_url(parts[0])
-            except ValueError as exc:
-                return str(exc)
-            existing = self.store.profiles.get(profile_id)
-            profile = existing or Profile(url=url, profile_id=profile_id)
-            profile.url = url
-            if len(parts) > 1:
-                profile.label = parts[1].strip()
-            self.store.profiles[profile_id] = profile
-            self.store.save()
-            self.check_requested.set()
-            return f"Профиль {profile_id} {'обновлён' if existing else 'добавлен'}."
-        if command == "/remove":
-            if not is_owner:
-                return "Удалять профили может только владелец."
-            profile_id = args.split()[0] if args else ""
-            if profile_id in self.store.profiles:
-                del self.store.profiles[profile_id]
-                self.store.save()
-                return f"Профиль {profile_id} удалён."
-            return "Профиль не найден."
-        if command == "/check":
-            target = (args or "all").lower()
-            profiles = (
-                list(self.store.profiles.values())
-                if target == "all"
-                else [self.store.profiles[target]]
-                if target in self.store.profiles
-                else []
-            )
-            if not profiles:
-                return "Профиль не найден или список пуст."
-
-            results = [self.check_one(profile, False) for profile in profiles]
-            return "\n\n".join(
-                format_profile(
-                    result,
-                    self.store.anime_cache,
-                    self.store.profiles[result.profile_id].label,
-                )
-                if result.ok
-                else f"❌ {html.escape(result.url)}\n{html.escape(result.error)}"
-                for result in results
-            )
-        if command == "/watching":
-            return self.watching_now_text()
-        if command == "/top":
-            return self.top_activity_text()
-        if command == "/random":
-            info = fetch_random_top_anime()
-            if not info:
-                return "❌ Не удалось получить случайное аниме, попробуйте еще раз."
-            return (
-                f"🎲 <b>Случайная рекомендация аниме:</b>\n\n"
-                f"🎬 <b>{html.escape(info['name_ru'])}</b> (<i>{html.escape(info['name_en'])}</i>)\n"
-                f"⭐ <b>Рейтинг:</b> {html.escape(str(info['score']))} | 📺 <b>Серий:</b> {html.escape(str(info['episodes']))}\n"
-                f"🎭 <b>Жанры:</b> {html.escape(info['genres'])}\n\n"
-                f"🍿 <a href='{info['link']}'>Смотреть на AniVox (ID {info['id']})</a>"
-            )
-        if command in {"/pingstatus", "/ping"}:
-            self.send_ping_menu(chat_id)
-            return ""
-        if command in {"/setping", "/seturl"}:
-            if not is_owner:
-                return "Менять ссылку авто-пинга может только владелец."
-            if not args:
-                return f"Текущая ссылка авто-пинга: <code>{html.escape(self.store.ping_url)}</code>\nПример: <code>/setping https://myhub-yhxu.onrender.com</code>"
-            new_url = args.strip().rstrip("/")
-            if not new_url.startswith(("http://", "https://")):
-                new_url = "https://" + new_url
-            self.store.ping_url = new_url
-            self.store.save()
-            code = do_single_ping(self.store)
-            return f"✅ Ссылка авто-пинга сохранена: <code>{html.escape(new_url)}/ping</code>\nПервый тестовый пинг: <b>{html.escape(code)}</b>"
-        if command == "/history":
-            return self.history_text(args)
-        if command == "/summary":
-            return self.summary_text()
-        if command in {"/html", "/report", "/site"}:
-            self.telegram.send_message(chat_id, "⏳ Генерирую дашборд с графиками...")
-            self.generate_html_report(chat_id)
-            return ""
-        if command in {"/find", "/search"}:
-            return self.search_text(args)
-        if command in {"/probe", "/test"}:
-            return self.probe_text()
-        if command == "/export":
-            return self.export_history(chat_id)
-        if command == "/cleanup":
-            if not is_owner:
-                return "Только владелец."
-            return self.cleanup_history(args)
-        if command == "/settings":
-            self.send_settings_menu(chat_id)
-            return ""
-        if command in {"/notifications", "/notif"}:
-            self.send_notifications_menu(chat_id)
-            return ""
-        if command == "/pause":
-            if not is_owner:
-                return "Только владелец."
-            self.paused = True
-            return "⏸ Проверки приостановлены."
-        if command == "/resume":
-            if not is_owner:
-                return "Только владелец."
-            self.paused = False
-            self.check_requested.set()
-            return "▶️ Проверки возобновлены."
-        if command in {"/friends", "/friend"}:
-            if not is_owner:
-                return "Управлять друзьями может только владелец."
-            parts = args.split()
-            if len(parts) == 2 and parts[0] == "add":
-                f_id = parts[1].strip()
-                if f_id not in self.store.allowed_users:
-                    self.store.allowed_users.append(f_id)
-                    self.store.save()
-                return f"✅ Пользователь <code>{f_id}</code> добавлен в Белый список! Теперь он будет получать уведомления и сможет использовать меню."
-            elif len(parts) == 2 and parts[0] == "remove":
-                f_id = parts[1].strip()
-                if f_id in self.store.allowed_users and f_id != self.store.chat_id:
-                    self.store.allowed_users.remove(f_id)
-                    self.store.save()
-                return f"✅ Пользователь {f_id} удален."
-            else:
-                f_list = "\n".join([f"• <code>{u}</code>" for u in self.store.allowed_users])
-                return (
-                    f"🎭 <b>Ваши друзья (имеют доступ к боту):</b>\n{f_list}\n\n"
-                    f"<i>Для добавления:</i>\n<code>/friend add ID</code>\n"
-                    f"<i>Для удаления:</i>\n<code>/friend remove ID</code>"
-                )
-
-        return "Неизвестная команда. Используйте /help."
-
-    def authorized(self, message: dict[str, Any]) -> bool:
-        chat_id = str(message.get("chat", {}).get("id", ""))
-        return chat_id in self.store.allowed_users
-
-    def _handle_callback(self, cb: dict[str, Any]) -> None:
-        chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-        msg_id = cb.get("message", {}).get("message_id")
-        data = cb.get("data", "")
-        query_id = cb.get("id")
-
-        if data.startswith("ping_"):
-            if data == "ping_now":
-                code = do_single_ping(self.store)
-                self.telegram.answer_callback_query(query_id, f"Пинг: {code}")
-            elif data in {"ping_int_4", "ping_int_10"}:
-                ping_state["ping_interval_min"] = 4 if data == "ping_int_4" else 10
-                self.telegram.answer_callback_query(
-                    query_id, f"Интервал авто-пинга: {ping_state['ping_interval_min']} мин."
-                )
-            else:
-                self.telegram.answer_callback_query(query_id, "Обновлено")
-            self.send_ping_menu(chat_id, msg_id)
-            return
-
-        if chat_id != self.store.chat_id:
-            self.telegram.answer_callback_query(query_id, "Настройки меняет только владелец!")
-            try:
-                self.telegram.send_message(
-                    self.store.chat_id,
-                    f"🕵️‍♂️ Друг (ID <code>{chat_id}</code>) попытался нажать кнопку настроек: <b>{html.escape(data)}</b>",
-                )
+                app_id = open_url.split("/app/")[1].split("/")[0]
+                sub_id = steam.get_subid_from_appid(app_id)
+                if sub_id and steam.add_free_license(sub_id):
+                    claimed.add(gid)
+                    save_json_set(CLAIMED_FILE, claimed)
+                    added += 1
+                    bot_status["claimed_count"] += 1
             except Exception:
                 pass
-            return
-
-        if data.startswith("quick_add_"):
-            pid = data.replace("quick_add_", "").strip()
-            url = f"https://anivox.fun/profile/{pid}"
-            self.store.profiles[pid] = Profile(url=url, profile_id=pid)
-            self.store.save()
-            self.check_requested.set()
-            self.telegram.answer_callback_query(query_id, f"Профиль {pid} добавлен!")
-            self.telegram.send_message(chat_id, f"✅ Профиль <code>{pid}</code> успешно добавлен в мониторинг!")
-            return
-
-        if data.startswith("set_int_"):
-            val = int(data.split("_")[-1])
-            self.store.settings.interval_minutes = val
-            self.store.save()
-            self.send_settings_menu(chat_id, msg_id)
-            self.telegram.answer_callback_query(query_id, f"Интервал изменен на {val} мин.")
-            self.check_requested.set()
-        elif data.startswith("set_cln_"):
-            val = int(data.split("_")[-1])
-            self.store.settings.auto_cleanup_days = val
-            self.store.save()
-            self.send_settings_menu(chat_id, msg_id)
-            self.telegram.answer_callback_query(query_id, f"Авто-очистка: {val} дн.")
-        elif data.startswith("ntf_"):
-            s = self.store.settings
-            if data == "ntf_onl":
-                s.notify_on_online = not s.notify_on_online
-            elif data == "ntf_off":
-                s.notify_on_offline = not s.notify_on_offline
-            elif data == "ntf_ttl":
-                s.notify_on_title = not s.notify_on_title
-            elif data == "ntf_err":
-                s.notify_on_errors = not s.notify_on_errors
-            elif data == "ntf_all":
-                s.notify_on_change = not s.notify_on_change
-            self.store.save()
-            self.send_notifications_menu(chat_id, msg_id)
-            self.telegram.answer_callback_query(query_id, "Настройки уведомлений обновлены.")
-        else:
-            self.telegram.answer_callback_query(query_id, "Готово")
-
-    def handle_update(self, update: dict[str, Any]) -> None:
-        if "callback_query" in update:
-            self._handle_callback(update["callback_query"])
-            return
-
-        message = update.get("message", {})
-        if not isinstance(message, dict):
-            return
-
-        chat_id = str(message.get("chat", {}).get("id", ""))
-        user_obj = message.get("from", {})
-        user_name = user_obj.get("username") or user_obj.get("first_name") or "Без имени"
-
-        if chat_id not in self.store.allowed_users:
-            try:
-                self.telegram.send_message(
-                    self.store.chat_id,
-                    f"🚨 <b>Внимание! Новый пользователь стучится в бота:</b>\n"
-                    f"• Имя: {html.escape(str(user_name))}\n"
-                    f"• ID: <code>{chat_id}</code>\n\n"
-                    f"Чтобы дать ему доступ, отправьте:\n<code>/friend add {chat_id}</code>",
-                )
-            except Exception:
-                pass
-
-            self.telegram.send_message(
-                chat_id,
-                f"⛔️ Доступ ограничен. Ваш ID: <code>{chat_id}</code>.\nВладелец бота получил уведомление о вашем запросе.",
-            )
-            return
-
-        is_owner = chat_id == self.store.chat_id
-        text = compact(message.get("text") or message.get("caption", ""))
-
-        if text in {"💬 Связать всех в чат", "/chat", "/chat_start"}:
-            self.start_bridge_chat(chat_id, user_name)
-            return
-
-        if text in {"🚪 Завершить чат", "/stopchat", "/chat_stop"}:
-            self.stop_bridge_chat(chat_id, user_name)
-            return
-
-        if self.bridge_chat_active and text and not text.startswith("/"):
-            button_names = {
-                "📊 Проверить всех",
-                "👥 Мои профили",
-                "🌐 Открыть сайт-отчет",
-                "🍿 Кто смотрит сейчас",
-                "🏆 Топ активности",
-                "🎲 Случайное аниме",
-                "📡 Авто-пинг",
-                "📈 История",
-                "⚙️ Настройки",
-                "🔕 Уведомления",
-                "🧪 Тест связи",
-                "⏸ Пауза",
-                "▶️ Продолжить",
-                "🎭 Друзья",
-                "➕ Добавить",
-                "🗑 Удалить",
-                "🔍 Поиск",
-            }
-            if text not in button_names:
-                self.relay_bridge_message(chat_id, user_name, text)
-                return
-
-        if not is_owner and text and not self.bridge_chat_active:
-            try:
-                self.telegram.send_message(
-                    self.store.chat_id,
-                    f"🕵️‍♂️ Друг (ID <code>{chat_id}</code>) нажал/написал:\n<b>{html.escape(text)}</b>",
-                )
-            except Exception:
-                pass
-
-        # Автоматический разбор ссылок на профили и аниме, если сообщение отправлено просто ссылкой
-        if text.startswith(("http://", "https://", "anivox.fun/")):
-            if self.inspect_link_message(chat_id, is_owner, text):
-                return
-
-        button_commands = {
-            "📊 Проверить всех": "/check all",
-            "👥 Мои профили": "/list",
-            "🌐 Открыть сайт-отчет": "/report",
-            "🍿 Кто смотрит сейчас": "/watching",
-            "🏆 Топ активности": "/top",
-            "🎲 Случайное аниме": "/random",
-            "📡 Авто-пинг": "/pingstatus",
-            "📈 История": "/history",
-            "⚙️ Настройки": "/settings",
-            "🔕 Уведомления": "/notifications",
-            "🧪 Тест связи": "/probe",
-            "⏸ Пауза": "/pause",
-            "▶️ Продолжить": "/resume",
-            "🎭 Друзья": "/friends",
-        }
-
-        if text in button_commands:
-            text = button_commands[text]
-
-        if text == "➕ Добавить":
-            self.telegram.send_message(
-                chat_id,
-                "Для добавления отправьте:\n<code>/add https://anivox.fun/profile/27788 метка</code>\n<i>(Либо просто скиньте ссылку на профиль в чат!)</i>",
-            )
-            return
-        if text == "🗑 Удалить":
-            self.telegram.send_message(chat_id, "Для удаления отправьте:\n<code>/remove ID</code>")
-            return
-        if text == "🔍 Поиск":
-            self.telegram.send_message(chat_id, "Для поиска отправьте:\n<code>/find текст</code>")
-            return
-
-        command, _, args = text.partition(" ")
-        command = command.lower().split("@", 1)[0]
-        response = self.command(chat_id, is_owner, command, args.strip())
-        if response:
-            try:
-                self.telegram.send_message(chat_id, response)
-            except TelegramError as exc:
-                logger.warning("Не удалось ответить в Telegram: %s", exc)
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                for update in self.telegram.get_updates(timeout=2):
-                    self.handle_update(update)
-            except TelegramError as exc:
-                logger.warning("Сбой сети Telegram, жду 5с: %s", exc)
-                self.stop_event.wait(5)
-            except Exception as exc:
-                logger.error("Критическая ошибка цикла: %s", exc)
-                self.stop_event.wait(5)
-            self.stop_event.wait(1)
-
-    def run_scheduler(self) -> None:
-        last_cleanup = 0.0
-        while not self.stop_event.is_set():
-            try:
-                if time.time() - last_cleanup > 3600:
-                    self.enforce_cleanup()
-                    last_cleanup = time.time()
-
-                if not self.paused:
-                    logger.info(
-                        "Автопроверка: профилей=%s, интервал=%s мин.",
-                        len(self.store.profiles),
-                        self.store.settings.interval_minutes,
-                    )
-                    self.check_all(True)
-                    self.generate_html_report(None)
-
-            except Exception as exc:
-                logger.error("Ошибка во время автопроверки: %s", exc, exc_info=True)
-
-            interval_sec = max(10, self.store.settings.interval_minutes * 60)
-            self.check_requested.wait(timeout=interval_sec)
-            if self.check_requested.is_set():
-                self.check_requested.clear()
+    return added
 
 
-def prompt(label: str) -> str:
+def giveaway_loop():
     while True:
-        value = input(label).strip()
-        if value:
-            return value
-        print("Значение не может быть пустым.")
-
-
-def run_self_test() -> int:
-    print(f"{APP_NAME} {VERSION} — автономная проверка")
-    checks = [
-        (
-            "получение реального публичного профиля через WebSocket",
-            lambda: _test_live_profile(),
-        ),
-        (
-            "разбор ссылки",
-            lambda: normalize_profile_url("https://anivox.fun/profile/27788")
-            == ("https://anivox.fun/profile/27788", "27788"),
-        ),
-        ("сохранение настроек", _test_store),
-    ]
-    failed = 0
-    for name, check in checks:
         try:
-            result = check()
-            if not result:
-                raise AssertionError("проверка вернула False")
-            print(f"  OK  {name}")
-        except Exception as exc:
-            failed += 1
-            print(f"  FAIL {name}: {exc}")
-    print(f"Результат: {len(checks) - failed}/{len(checks)} проверок.")
-    return 1 if failed else 0
+            if steam.is_configured():
+                check_giveaways()
+        except Exception:
+            pass
+        time.sleep(CHECK_GIVEAWAYS_INTERVAL)
 
 
-def _test_live_profile() -> bool:
-    url, profile_id = normalize_profile_url("https://anivox.fun/profile/27788")
-    result = fetch_profile(Profile(url=url, profile_id=profile_id), timeout=20)
-    print(format_profile(result, {}))
-    return result.ok and result.nickname != "неизвестно" and result.level != "неизвестно"
+# ----------------- ВЕБ-САЙТ УПРАВЛЕНИЯ (БЕЗ ТРОЙНЫХ КАВЫЧЕК!) -----------------
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(16)
+
+HTML_LINES = [
+    "<!DOCTYPE html><html lang='ru'><head><meta charset='UTF-8'>",
+    "<meta name='viewport' content='width=device-width, initial-scale=1.0'>",
+    "<title>Steam Ultimate Control Center</title>",
+    "<style>",
+    "body{font-family:system-ui,sans-serif;background:#0b1120;color:#f8fafc;margin:0;padding:15px;}",
+    ".container{max-width:1080px;margin:0 auto;}",
+    ".header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #334155;padding-bottom:12px;margin-bottom:16px;}",
+    "h1,h3{color:#38bdf8;margin-top:0;}",
+    ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:15px;margin-bottom:15px;}",
+    ".card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;}",
+    "input,select,textarea{width:100%;box-sizing:border-box;padding:9px;margin:5px 0;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#fff;}",
+    "button{background:#0284c7;color:#fff;border:none;padding:9px 14px;border-radius:8px;font-weight:bold;cursor:pointer;margin-top:5px;}",
+    ".btn-green{background:#16a34a;}.btn-red{background:#e11d48;}",
+    ".ok{color:#4ade80;font-weight:bold;}.err{color:#f87171;font-weight:bold;}",
+    ".alert{background:#0369a1;padding:12px;border-radius:8px;margin-bottom:15px;font-weight:bold;}",
+    ".list-box{max-height:240px;overflow-y:auto;background:#0f172a;padding:10px;border-radius:8px;font-size:13px;}",
+    ".list-item{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #1e293b;}",
+    "</style></head><body><div class='container'>",
+    "<div class='header'><h1>🚀 Steam Ultimate Web Panel</h1>",
+    "{% if logged_in %}<form method='POST' action='/logout'><button class='btn-red'>Выйти</button></form>{% endif %}</div>",
+    "{% if web_msg %}<div class='alert'>💡 {{ web_msg }}</div>{% endif %}",
+    "{% if not logged_in %}",
+    "<div class='card' style='max-width:400px;margin:30px auto;'><h3>🔐 Вход в панель (пароль в tok.json, по умолч. admin123)</h3>",
+    "<form method='POST' action='/login'><input type='password' name='password' placeholder='Пароль' required>",
+    "<button type='submit' style='width:100%;'>Войти</button></form></div>",
+    "{% else %}",
+    "<div class='grid'>",
+    "<div class='card'><h3>👤 Аккаунт и Баланс</h3>",
+    "<p>Статус: <span class='{{ \"ok\" if steam_ok else \"err\" }}'>{{ account_name if steam_ok else \"Не авторизован\" }}</span></p>",
+    "<p>💰 Баланс: <b>{{ balance }}</b> | 🎁 Раздач: <b>{{ status.claimed_count }}</b> | 🎮 F2P: <b>{{ status.f2p_added_count }}</b></p>",
+    "<form method='POST' action='/web_action'><input type='hidden' name='act' value='update_profile'>",
+    "<input type='text' name='bio' placeholder='Новый текст «О себе»'><input type='text' name='nick' placeholder='Новый Никнейм'>",
+    "<button type='submit'>📝 Обновить профиль</button></form></div>",
+    "<div class='card'><h3>🎮 Фарм F2P (Рандом и Авто 15м)</h3>",
+    "<p>Авто-сбор всех F2P (15 мин): <b>{{ 'ВКЛ' if status.f2p_auto_all_enabled else 'ВЫКЛ' }}</b></p>",
+    "<form method='POST' action='/web_action' style='display:flex;gap:6px;flex-wrap:wrap;'>",
+    "<button name='act' value='f2p_rand_5' class='btn-green'>🎲 +5 F2P</button>",
+    "<button name='act' value='f2p_rand_15' class='btn-green'>🎲 +15 F2P</button>",
+    "<button name='act' value='f2p_toggle'>♾️ Вкл/Выкл Авто (15м)</button>",
+    "<button name='act' value='check_giveaways'>🎁 Проверить раздачи</button></form>",
+    "<form method='POST' action='/web_action' style='margin-top:8px;'><input type='hidden' name='act' value='redeem_key'>",
+    "<input type='text' name='cdkey' placeholder='Ключ Steam (XXXXX-XXXXX-XXXXX)'><button type='submit'>🔑 Активировать ключ</button></form></div>",
+    "<div class='card'><h3>📡 Тихий Самопинг</h3>",
+    "<p>Пингов: <b>{{ status.ping_count }}</b> ({{ status.last_ping_time }} — {{ status.last_ping_code }})</p>",
+    "<div class='list-box' style='height:90px;'>{% for l in status.ping_history|reverse %}{{ l }}<br>{% endfor %}</div>",
+    "<form method='POST' action='/web_action' style='display:flex;gap:6px;'>",
+    "<button name='act' value='ping_now'>⚡ Пинг</button><button name='act' value='ping_4'>⏱ 4м</button><button name='act' value='ping_14'>⏱ 14м</button></form></div>",
+    "</div>",
+    "<div class='grid'>",
+    "<div class='card'><h3>🧮 Калькулятор Скидок (₸) и Автопокупка</h3>",
+    "<form method='POST' action='/web_action'><input type='hidden' name='act' value='add_watch'>",
+    "<input type='text' name='appid' placeholder='AppID игры (например 1091500)' required>",
+    "<input type='number' name='discount' value='50' min='1' max='99'>",
+    "<select name='mode'><option value='autobuy'>🛒 Автопокупка (5-15 мин)</option><option value='notify'>🔔 Только уведомление</option></select>",
+    "<button type='submit'>➕ Рассчитать в ₸ и сохранить</button></form>",
+    "<div class='list-box' style='margin-top:8px;'>{% for aid, w in watchlist.items() %}",
+    "<div class='list-item'><span><b>{{ w.name }}</b> ({{ aid }}) -{{ w.target_disc }}% [{{ w.mode }}]</span>",
+    "<form method='POST' action='/web_action' style='margin:0;'><input type='hidden' name='act' value='del_watch'><input type='hidden' name='appid' value='{{ aid }}'><button class='btn-red' style='padding:3px 7px;margin:0;'>🗑</button></form></div>",
+    "{% else %}Список пуст{% endfor %}</div></div>",
+    "<div class='card'><h3>📊 Статистика Игры по AppID</h3>",
+    "<form method='POST' action='/web_action'><input type='hidden' name='act' value='inspect_game'>",
+    "<input type='text' name='appid' placeholder='AppID игры (730, 570, 1091500)' required>",
+    "<button type='submit'>🔎 Статистика и цены</button> <button type='submit' name='subact' value='free_dlc' class='btn-green'>🎁 Собрать бесплатные DLC</button></form>",
+    "{% if game_stat %}<div class='list-box' style='margin-top:8px;white-space:pre-line;'>{{ game_stat }}</div>{% endif %}</div>",
+    "</div>",
+    "<div class='grid'>",
+    "<div class='card'><h3>📚 Библиотека ({{ lib_items|length }} игр: 🔒 {{ paid_cnt }} | ❌ {{ free_cnt }})</h3>",
+    "<form method='POST' action='/web_action'><button name='act' value='reload_lib'>🔄 Загрузить библиотеку со Steam</button></form>",
+    "<div class='list-box' style='margin-top:8px;'>{% for item in lib_items[:60] %}",
+    "<div class='list-item'><span>{{ '❌' if item.removable else '🔒' }} <b>{{ item.name }}</b> ({{ item.date }})</span>",
+    "{% if item.removable %}<form method='POST' action='/web_action' style='margin:0;'><input type='hidden' name='act' value='del_pkg'><input type='hidden' name='pkgid' value='{{ item.packageid }}'><button class='btn-red' style='padding:3px 7px;margin:0;'>Удалить</button></form>{% else %}<span>🔒</span>{% endif %}</div>",
+    "{% endfor %}</div></div>",
+    "<div class='card'><h3>🔄 Автообновление Кода Бота</h3>",
+    "<form method='POST' action='/web_update' enctype='multipart/form-data'>",
+    "<input type='file' name='pyfile' accept='.py,.txt'>",
+    "<textarea name='code' rows='4' placeholder='ИЛИ вставьте новый Python-код сюда...'></textarea>",
+    "<button type='submit' class='btn-green'>🚀 Проверить и обновить бота</button></form></div>",
+    "</div>{% endif %}</div></body></html>",
+]
+HTML_DASHBOARD = "\n".join(HTML_LINES)
 
 
-def _test_store() -> bool:
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "state.json"
-        store = Store(path)
-        store.profiles["27788"] = Profile("https://anivox.fun/profile/27788", "27788")
-        store.save()
-        return "27788" in Store(path).profiles
-
-
-def main() -> int:
-    if "--self-test" in sys.argv[1:]:
-        return run_self_test()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        ],
+@app.route("/")
+def web_index():
+    if not session.get("logged_in"):
+        return render_template_string(HTML_DASHBOARD, logged_in=False, web_msg=bot_status["web_msg"])
+    ok, bal = steam.check_health()
+    items = library_cache.get("web") or []
+    paid_c = sum(1 for x in items if not x["removable"])
+    free_c = sum(1 for x in items if x["removable"])
+    msg = bot_status["web_msg"]
+    bot_status["web_msg"] = ""
+    return render_template_string(
+        HTML_DASHBOARD,
+        logged_in=True,
+        steam_ok=ok,
+        account_name=steam.data.get("account_name", "User"),
+        balance=bal,
+        status=bot_status,
+        watchlist=steam.data.get("watchlist", {}),
+        lib_items=items,
+        paid_cnt=paid_c,
+        free_cnt=free_c,
+        game_stat=web_game_stat_cache,
+        web_msg=msg,
     )
-    store = Store(CONFIG_PATH)
-    if not store.token:
-        store.token = prompt("Токен Telegram-бота: ")
-    if not store.chat_id:
-        store.chat_id = prompt("Ваш chat ID: ")
-    store.save()
-    telegram = TelegramClient(store.token)
+
+
+@app.route("/login", methods=["POST"])
+def web_login():
+    if request.form.get("password") == tok_config["web_password"]:
+        session["logged_in"] = True
+        bot_status["web_msg"] = "Вход выполнен!"
+    else:
+        bot_status["web_msg"] = "Неверный пароль!"
+    return redirect(url_for("web_index"))
+
+
+@app.route("/logout", methods=["POST"])
+def web_logout():
+    session.clear()
+    return redirect(url_for("web_index"))
+
+
+@app.route("/web_action", methods=["POST"])
+def web_action():
+    global web_game_stat_cache
+    if not session.get("logged_in"):
+        return redirect(url_for("web_index"))
+    act = request.form.get("act", "")
+    if act == "ping_now":
+        do_single_ping()
+        bot_status["web_msg"] = f"Пинг: {bot_status['last_ping_code']}"
+    elif act in ("ping_4", "ping_14"):
+        bot_status["ping_interval_min"] = 4 if act == "ping_4" else 14
+        bot_status["web_msg"] = f"Интервал пинга: {bot_status['ping_interval_min']} мин."
+    elif act == "update_profile":
+        bio = request.form.get("bio", "").strip()
+        nick = request.form.get("nick", "").strip()
+        steam.update_profile_field(summary=bio if bio else None, persona_name=nick if nick else None)
+        bot_status["web_msg"] = "Профиль обновлен!"
+    elif act in ("f2p_rand_5", "f2p_rand_15"):
+        cnt = 5 if act == "f2p_rand_5" else 15
+        threading.Thread(target=steam.add_random_f2p_batch, args=(cnt,), daemon=True).start()
+        bot_status["web_msg"] = f"Запущено добавление {cnt} рандомных F2P игр!"
+    elif act == "f2p_toggle":
+        bot_status["f2p_auto_all_enabled"] = not bot_status["f2p_auto_all_enabled"]
+        steam.data["f2p_auto_all"] = bot_status["f2p_auto_all_enabled"]
+        save_session(steam.data)
+        bot_status["web_msg"] = "Авто-фарм F2P (15 мин) переключен!"
+    elif act == "check_giveaways":
+        cnt = check_giveaways()
+        bot_status["web_msg"] = f"Раздач добавлено: {cnt}"
+    elif act == "redeem_key":
+        k = request.form.get("cdkey", "").strip()
+        if k:
+            res = steam.redeem_cd_key(k)
+            bot_status["web_msg"] = f"Ключ активирован: {res.get('games')}" if res.get("ok") else "Ошибка ключа."
+    elif act == "add_watch":
+        aid = re.sub(r"\D", "", request.form.get("appid", ""))
+        disc = max(1, min(99, int(request.form.get("discount", 50) or 50)))
+        mode = request.form.get("mode", "notify")
+        info = steam.get_game_price_info(aid) if aid else None
+        if info:
+            calc_p = round(info["initial_kzt"] * (100 - disc) / 100.0, 2)
+            steam.data.setdefault("watchlist", {})[aid] = {"name": info["name"], "target_disc": disc, "mode": mode, "last_discount": info["discount"]}
+            save_session(steam.data)
+            bot_status["web_msg"] = f"{info['name']}: со скидкой -{disc}% = {calc_p:g} ₸. Сохранено!"
+    elif act == "del_watch":
+        steam.data.get("watchlist", {}).pop(request.form.get("appid", ""), None)
+        save_session(steam.data)
+    elif act == "inspect_game":
+        aid = re.sub(r"\D", "", request.form.get("appid", ""))
+        if request.form.get("subact") == "free_dlc" and aid:
+            dlcs = steam.add_free_dlcs_for_game(aid)
+            bot_status["web_msg"] = f"Добавлено бесплатных DLC: {len(dlcs)} шт."
+        elif aid:
+            info = steam.get_game_price_info(aid)
+            players = steam.get_live_player_count(aid)
+            _, reg_lines = steam.compare_regional_prices(aid)
+            if info:
+                web_game_stat_cache = f"🎮 {info['name']} ({aid})\n👥 Онлайн: {players}\n⭐ Metacritic: {info['metacritic']} | Цена KZ: {info['final_formatted']}\n🌍 {' | '.join([strip_html(x) for x in reg_lines])}"
+    elif act == "reload_lib":
+        library_cache["web"] = steam.get_all_licenses()
+        bot_status["web_msg"] = f"Библиотека загружена: {len(library_cache['web'])} игр."
+    elif act == "del_pkg":
+        pkgid = request.form.get("pkgid", "")
+        if steam.remove_license(pkgid):
+            if "web" in library_cache:
+                library_cache["web"] = [x for x in library_cache["web"] if x["packageid"] != pkgid]
+            bot_status["web_msg"] = f"Лицензия {pkgid} удалена!"
+    return redirect(url_for("web_index"))
+
+
+@app.route("/web_update", methods=["POST"])
+def web_update():
+    if not session.get("logged_in"):
+        return redirect(url_for("web_index"))
+    uploaded = request.files.get("pyfile")
+    new_code = uploaded.read().decode("utf-8-sig", errors="replace") if (uploaded and uploaded.filename) else request.form.get("code", "")
+    _, msg = apply_new_bot_code(steam.data.get("admin_id"), new_code)
+    bot_status["web_msg"] = f"Автообновление: {msg}"
+    return redirect(url_for("web_index"))
+
+
+@app.route("/ping")
+def ping_endpoint():
+    return jsonify({"status": "alive", "steam_configured": steam.is_configured(), "last_ping": bot_status["last_ping_time"], "ping_count": bot_status["ping_count"]}), 200
+
+
+def do_single_ping():
+    base_url = steam.data.get("render_url") or os.environ.get("RENDER_EXTERNAL_URL") or tok_config["render_url"]
+    ping_url = f"{base_url.rstrip('/')}/ping"
+    bot_status["last_ping_url"] = ping_url
+    t0 = time.time()
     try:
-        account = telegram.get_me()
-    except TelegramError as exc:
-        print(f"Ошибка проверки токена: {exc}")
-        return 2
-    print(f"Бот подтверждён: @{account.get('username', 'без username')}")
-    monitor = Monitor(store, telegram)
-    signal.signal(signal.SIGINT, monitor.stop)
-    signal.signal(signal.SIGTERM, monitor.stop)
-    try:
-        telegram.send_message(
-            store.chat_id,
-            f"✅ <b>AniVox Monitor {VERSION} запущен.</b>\n"
-            "• Архитектура АНТИ-ФРИЗ и общий мост-чат активны.\n"
-            "• Включен тихий авто-пинг (каждые 3–5 мин), чтобы сервер не засыпал.\n"
-            "• Добавлен быстрый разбор любых ссылок на профили и аниме прямо в чате.",
-            reply_markup=TELEGRAM_KEYBOARD,
-        )
-    except TelegramError as exc:
-        logger.warning("Стартовое сообщение не отправилось: %s", exc)
+        r = requests.get(ping_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+        ms = int((time.time() - t0) * 1000)
+        now_str = time.strftime("%H:%M:%S")
+        bot_status["last_ping_ts"] = time.time()
+        bot_status["last_ping_time"] = now_str
+        bot_status["last_ping_code"] = f"HTTP {r.status_code} ({ms} мс)"
+        bot_status["ping_count"] += 1
+        bot_status["ping_history"].append(f"• {now_str} — ✅ HTTP {r.status_code} ({ms} мс)")
+    except Exception:
+        now_str = time.strftime("%H:%M:%S")
+        bot_status["last_ping_ts"] = time.time()
+        bot_status["last_ping_time"] = now_str
+        bot_status["last_ping_code"] = "Ошибка"
+        bot_status["ping_history"].append(f"• {now_str} — ❌ Ошибка сети")
+    if len(bot_status["ping_history"]) > 10:
+        bot_status["ping_history"] = bot_status["ping_history"][-10:]
 
-    threading.Thread(
-        target=run_web_server,
-        name="anivox-webserver",
-        daemon=True,
-    ).start()
 
-    threading.Thread(
-        target=run_keep_alive_pinger,
-        args=(store, monitor.stop_event),
-        name="anivox-keepalive",
-        daemon=True,
-    ).start()
+def keep_alive_pinger():
+    time.sleep(10)
+    do_single_ping()
+    while True:
+        interval_sec = max(60, int(bot_status.get("ping_interval_min", 4)) * 60)
+        time.sleep(max(60, interval_sec + random.randint(-20, 20)))
+        do_single_ping()
 
-    scheduler = threading.Thread(
-        target=monitor.run_scheduler,
-        name="anivox-scheduler",
-        daemon=True,
-    )
-    scheduler.start()
-    try:
-        monitor.run()
-    finally:
-        monitor.stop()
-        scheduler.join(timeout=5)
-        store.save()
-    return 0
 
-# ----------------- ЗАПУСК: СУПЕРВИЗОР И ВОРКЕР -----------------
+def notify_if_just_updated():
+    upd_flag = steam.data.pop("just_updated", None)
+    if upd_flag:
+        save_session(steam.data)
+        admin_id = steam.data.get("admin_id")
+        if admin_id:
+            time.sleep(1.5)
+            notify_user(admin_id, f"🎉 **Автообновление успешно установлено (`{upd_flag}`)!**")
+
+
 def run_supervisor():
     script_path = os.path.abspath(__file__)
     env = os.environ.copy()
     env["BOT_WORKER_MODE"] = "1"
-
     while True:
         start_ts = time.time()
-        print("[Supervisor] Запуск рабочего процесса бота и веб-панели...")
         proc = subprocess.Popen([sys.executable, script_path], env=env)
         exit_code = proc.wait()
-        runtime = time.time() - start_ts
-
         if exit_code == 42:
-            print("[Supervisor] Сигнал автообновления (42). Перезапуск через 2 сек...")
             time.sleep(2)
             continue
-
-        if runtime < 5 and os.path.exists(BACKUP_FILE):
-            print("[Supervisor] Сбой при старте! Откат к резервной копии...")
+        if (time.time() - start_ts) < 5 and os.path.exists(BACKUP_FILE):
             try:
                 shutil.copyfile(BACKUP_FILE, script_path)
             except Exception:
@@ -2208,7 +1989,6 @@ def run_supervisor():
 
 def run_worker():
     port = int(os.environ.get("PORT", 10000))
-    # Запускаем Flask в отдельном потоке внутри воркера один раз
     try:
         threading.Thread(
             target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
@@ -2226,9 +2006,8 @@ def run_worker():
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception as e:
-            print(f"[Worker] Ошибка polling: {e}")
-            time.sleep(5)
+        except Exception:
+            time.sleep(3)
 
 
 if __name__ == "__main__":
