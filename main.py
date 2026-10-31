@@ -4,26 +4,24 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import html
-import http.server
+import io
 import json
-import logging
 import os
 import random
 import re
-import signal
-import socket
-import socketserver
-import ssl
-import struct
+import secrets
+import shutil       # <-- проверьте, чтобы был shutil
+import subprocess   # <-- ДОБАВЬТЕ ЭТУ СТРОКУ
 import sys
-import tempfile
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
+import requests
+import rsa
+import telebot
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
