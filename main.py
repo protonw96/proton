@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AniVox Monitor v4.5.0 (Anti-Freeze Architecture & Direct Anime ID Links & Force Bridge Chat)."""
+"""AniVox Monitor v4.5.0 (Anti-Freeze Architecture & Direct Anime ID Links & Force Bridge Chat & Render AutoPing)."""
 
 from __future__ import annotations
 
@@ -191,8 +191,9 @@ class Store:
     def __init__(self, path: Path) -> None:
         raw = load_json(path)
         self.path = path
-        self.token = str(raw.get("token", "")).strip()
-        self.chat_id = str(raw.get("chat_id", "")).strip()
+        self.token = str(raw.get("token", os.environ.get("BOT_TOKEN", ""))).strip()
+        self.chat_id = str(raw.get("chat_id", os.environ.get("CHAT_ID", ""))).strip()
+        self.autoping_url = str(raw.get("autoping_url", os.environ.get("RENDER_EXTERNAL_URL", ""))).strip()
         
         self.allowed_users: list[str] = raw.get("allowed_users", [])
         if self.chat_id and self.chat_id not in self.allowed_users:
@@ -267,6 +268,7 @@ class Store:
             {
                 "token": self.token,
                 "chat_id": self.chat_id,
+                "autoping_url": self.autoping_url,
                 "allowed_users": self.allowed_users,
                 "anime_cache": self.anime_cache,
                 "settings": asdict(self.settings),
@@ -758,14 +760,26 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-def run_web_server(port: int = 15887):
-    """Запускает веб-сервер в директории со скриптом."""
+def get_public_base_url(store: Store) -> str:
+    """Возвращает базовый URL сайта (из настроек /autoping, переменной Render или локального IP)."""
+    if store.autoping_url:
+        return store.autoping_url.rstrip("/")
+    render_env = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    if render_env:
+        return render_env.rstrip("/")
+    port = int(os.environ.get("PORT", 15887))
+    return f"http://78.154.103.11:{port}"
+
+def run_web_server(store: Store, port: int = 15887):
+    """Запускает веб-сервер в директории со скриптом с поддержкой порта Render.com."""
+    actual_port = int(os.environ.get("PORT", port))
     work_dir = os.path.dirname(os.path.abspath(CONFIG_PATH))
     os.chdir(work_dir)
     try:
         socketserver.TCPServer.allow_reuse_address = True
-        with socketserver.TCPServer(("", port), QuietHTTPRequestHandler) as httpd:
-            logger.info(f"Web-сервер запущен: http://78.154.103.11:{port}/anivox_report.html")
+        with socketserver.TCPServer(("0.0.0.0", actual_port), QuietHTTPRequestHandler) as httpd:
+            base_url = get_public_base_url(store)
+            logger.info(f"Web-сервер запущен на порту {actual_port}: {base_url}/anivox_report.html")
             httpd.serve_forever()
     except Exception as e:
         logger.error(f"Ошибка запуска Web-сервера: {e}")
@@ -778,12 +792,33 @@ class Monitor:
         self.paused = False
         self.check_lock = threading.RLock()
         self.check_requested = threading.Event()
+        self.ping_requested = threading.Event()
         self.bridge_chat_active: bool = False
         self.bridge_chat_initiator: str = ""
         self.chat_lock = threading.Lock()
 
     def stop(self, *_args: Any) -> None:
         self.stop_event.set()
+        self.check_requested.set()
+        self.ping_requested.set()
+
+    def run_autoping(self) -> None:
+        """Фоновый цикл автопинга ссылки Render.com каждые 5 минут (300 секунд)."""
+        while not self.stop_event.is_set():
+            target_url = self.store.autoping_url.strip()
+            if target_url:
+                try:
+                    req = urllib.request.Request(
+                        target_url,
+                        headers={"User-Agent": DEFAULT_USER_AGENT},
+                    )
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        logger.info("Автопинг успешен: %s (Статус: %s)", target_url, resp.getcode())
+                except Exception as exc:
+                    logger.warning("Ошибка автопинга (%s): %s", target_url, exc)
+            self.ping_requested.wait(timeout=300)
+            if self.ping_requested.is_set():
+                self.ping_requested.clear()
 
     def start_bridge_chat(self, sender_id: str, sender_name: str) -> None:
         with self.chat_lock:
@@ -1191,11 +1226,12 @@ class Monitor:
         path.write_text("\n".join(html_doc), encoding="utf-8")
         
         if chat_id:
+            base_url = get_public_base_url(self.store)
             try:
                 self.telegram.send_document(
                     chat_id, 
                     path, 
-                    caption="🌐 Нейро-Отчет обновлен! Можете открыть этот файл или перейти по адресу: http://78.154.103.11:15887/anivox_report.html в браузере вашего телефона."
+                    caption=f"🌐 Нейро-Отчет обновлен! Можете открыть этот файл или перейти по адресу: {base_url}/anivox_report.html в браузере вашего телефона."
                 )
             except Exception as exc:
                 self.telegram.send_message(chat_id, f"❌ Ошибка отправки отчета: {exc}")
@@ -1290,8 +1326,38 @@ class Monitor:
                 "<code>/settings</code> — меню настроек\n"
                 "<code>/notifications</code> — настройка уведомлений\n"
                 "<code>/friends</code> — управление друзьями\n"
+                "<code>/autoping &lt;ссылка&gt;</code> — автопинг ссылки для Render.com\n"
                 "<code>/chat</code> — принудительно связать всех в общий чат\n"
                 "<code>/stopchat</code> — завершить общий чат для всех"
+            )
+        if command == "/autoping":
+            if not is_owner:
+                return "Настраивать автопинг может только владелец."
+            arg = args.strip()
+            if not arg:
+                current = self.store.autoping_url or "не задана (отключен)"
+                return (
+                    f"🌐 <b>Текущая ссылка автопинга:</b> <code>{html.escape(current)}</code>\n\n"
+                    "Чтобы задать ссылку Render.com, отправьте:\n"
+                    "<code>/autoping https://ваш-проект.onrender.com</code>\n\n"
+                    "Чтобы отключить автопинг:\n"
+                    "<code>/autoping off</code>"
+                )
+            if arg.lower() in {"off", "stop", "0", "выкл", "нет"}:
+                self.store.autoping_url = ""
+                self.store.save()
+                return "🛑 Автопинг отключен."
+            if not arg.startswith(("http://", "https://")):
+                arg = "https://" + arg
+            self.store.autoping_url = arg.rstrip("/")
+            self.store.save()
+            self.ping_requested.set()
+            return (
+                f"✅ <b>Автопинг установлен и запущен!</b>\n"
+                f"🔗 Ссылка: <code>{html.escape(self.store.autoping_url)}</code>\n"
+                f"⏱ Интервал пинга: каждые 5 минут.\n"
+                f"📊 Ваш сайт-отчет теперь доступен по адресу:\n"
+                f"{html.escape(self.store.autoping_url)}/anivox_report.html"
             )
         if command == "/list":
             if not self.store.profiles:
@@ -1664,7 +1730,7 @@ def main() -> int:
         telegram.send_message(
             store.chat_id,
             f"✅ <b>AniVox Monitor {VERSION} запущен.</b>\n"
-            "Архитектура АНТИ-ФРИЗ включена. Добавлен принудительный общий мост-чат для всех участников.",
+            "Архитектура АНТИ-ФРИЗ включена. Добавлен принудительный общий мост-чат и команда <code>/autoping ссылка</code>.",
             reply_markup=TELEGRAM_KEYBOARD,
         )
     except TelegramError as exc:
@@ -1672,6 +1738,13 @@ def main() -> int:
         
     threading.Thread(
         target=run_web_server,
+        args=(store,),
+        daemon=True,
+    ).start()
+
+    threading.Thread(
+        target=monitor.run_autoping,
+        name="anivox-autoping",
         daemon=True,
     ).start()
     
