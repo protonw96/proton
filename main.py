@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
-APP_NAME, VERSION = "AniVox Monitor", "xyina","5.0.0"
+APP_NAME, VERSION = "AniVox Monitor", "5.0.0"
 SELF_PATH = Path(__file__).resolve()
 CONFIG_PATH = SELF_PATH.with_name("anivox_monitor.json")
 LOG_PATH = SELF_PATH.with_name("anivox_monitor.log")
