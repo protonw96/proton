@@ -3,3 +3,4 @@ pyTelegramBotAPI
 flask
 rsa
 aiogram
+yt_dlp
