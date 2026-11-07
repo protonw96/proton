@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """AniVox Monitor v5.0.0 Ultimate (GitHub JSON Cloud Sync, Interactive GitHub Setup Wizard, Avatars & Bio, Psters, Heatmap, VS Mode & 32+ Pro Features)."""
 
 from __future__ import annotations
