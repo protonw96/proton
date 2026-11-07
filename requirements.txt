@@ -2,3 +2,4 @@ requests
 pyTelegramBotAPI
 flask
 rsa
+aiogram
