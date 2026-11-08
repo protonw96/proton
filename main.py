@@ -1392,4 +1392,4 @@ class Monitor:
                     genre_counter[g] = genre_counter.get(g, 0) + 1
 
             for h in history:
-                ts = int(h.get("timestamp") or
+                ts = int((h.get("timestamp") or
