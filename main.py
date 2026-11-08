@@ -1391,5 +1391,892 @@ class Monitor:
                 for g in c_item.get("genres", []):
                     genre_counter[g] = genre_counter.get(g, 0) + 1
 
-            for h in history:
-                ts = int(h.get("timestamp")) or
+                    for h in history:
+            raw_ts = h.get("timestamp") or h.get("ts") or 0
+            if isinstance(raw_ts, str) and not raw_ts.isdigit():
+                try:
+                    ts = int(datetime.fromisoformat(raw_ts).timestamp())
+                except Exception:
+                    ts = 0
+            else:
+                ts = int(raw_ts or 0)
+
+            if ts > 0:
+                hourly_activity[datetime.fromtimestamp(ts).hour] += 1
+
+            det = h.get("details", "")
+            if "Смотрит:" in det:
+                t_name = det.split("Смотрит:", 1)[1].strip()
+                if t_name and t_name != "Ничего не смотрит":
+                    title_counts[t_name] = title_counts.get(t_name, 0) + 1
+
+        profile_cards_html = ""
+        leaderboard_rows_html = ""
+        cnt_online = 0
+        cnt_watching = 0
+        cnt_offline = 0
+
+        # Сортировка профилей для рейтинга активности во 2-й вкладке
+        sorted_profs = sorted(
+            profiles.items(),
+            key=lambda kv: (kv[1].get("online_seconds", 0), kv[1].get("titles_watched", 0)),
+            reverse=True
+        )
+        max_onl_sec = max([p.get("online_seconds", 0) for _, p in sorted_profs] + [60])
+
+        for rank, (pid, pdata) in enumerate(sorted_profs, 1):
+            name = pdata.get("nickname") or pdata.get("name") or f"ID #{pid}"
+            is_onl = bool(pdata.get("online", False))
+            cur_title = pdata.get("current_title") or pdata.get("anime") or "Ничего не смотрит"
+            is_wat = bool(pdata.get("watching", False) or (is_onl and cur_title != "Ничего не смотрит"))
+
+            # 3 состояния аватарки: Фиолетовая (смотрит), Зеленая (онлайн), Серая (оффлайн)
+            if is_wat:
+                state_key = "watching"
+                card_state_cls = "state-watching"
+                badge_html = '<span class="status-badge badge-watching">🟣 СМОТРИТ</span>'
+                cnt_watching += 1
+                cnt_online += 1
+            elif is_onl:
+                state_key = "online"
+                card_state_cls = "state-online"
+                badge_html = '<span class="status-badge badge-online">🟢 В СЕТИ</span>'
+                cnt_online += 1
+            else:
+                state_key = "offline"
+                card_state_cls = "state-offline"
+                badge_html = '<span class="status-badge badge-offline">⚪ ОФФЛАЙН</span>'
+                cnt_offline += 1
+
+            if cur_title and cur_title != "Ничего не смотрит":
+                title_counts[cur_title] = title_counts.get(cur_title, 0) + 1
+
+            ava_url = pdata.get("avatar") or make_svg_avatar(name)
+            fallback_ava = make_svg_avatar(name)
+            chg_ts = int(pdata.get("last_status_change") or pdata.get("updated_at") or now_ts)
+            chg_dt_str = datetime.fromtimestamp(chg_ts).strftime("%d.%m.%Y в %H:%M:%S")
+            prev_st = pdata.get("prev_status") or "Нет данных"
+            onl_sec = int(pdata.get("online_seconds", 0))
+            onl_hours_str = f"{onl_sec // 3600}ч {(onl_sec % 3600) // 60}м"
+            watched_cnt = int(pdata.get("titles_watched", 0))
+
+            profile_cards_html += f"""
+            <div class="prof-card {card_state_cls}" data-state="{state_key}" data-name="{name.lower()} {cur_title.lower()}">
+                <div class="prof-top">
+                    <div class="ava-wrap {card_state_cls}">
+                        <img src="{ava_url}" alt="{name}" class="ava-img" onerror="this.onerror=null;this.src='{fallback_ava}';">
+                        <span class="ava-dot"></span>
+                    </div>
+                    <div class="prof-meta">
+                        <div class="prof-name-row">
+                            <span class="prof-name">{name}</span>
+                            {badge_html}
+                        </div>
+                        <div class="prof-sub">AniVox ID: <b>#{pid}</b> • Тайтлов: <b>{watched_cnt}</b></div>
+                    </div>
+                </div>
+
+                <div class="watching-box">
+                    <div class="watching-lbl">🎬 Текущий тайтл / активность:</div>
+                    <div class="watching-val">{cur_title}</div>
+                </div>
+
+                <div class="time-panel">
+                    <div class="time-item">
+                        <span class="t-lbl">📅 Статус изменен:</span>
+                        <span class="t-val">{chg_dt_str}</span>
+                    </div>
+                    <div class="time-item">
+                        <span class="t-lbl">⏳ Длительность:</span>
+                        <span class="t-val live-timer" data-ts="{chg_ts}">считаем...</span>
+                    </div>
+                    <div class="time-item">
+                        <span class="t-lbl">⏮ До этого:</span>
+                        <span class="t-val t-muted">{prev_st}</span>
+                    </div>
+                </div>
+            </div>
+            """
+
+            pct = min(100, int((onl_sec / max_onl_sec) * 100)) if max_onl_sec > 0 else 10
+            leaderboard_rows_html += f"""
+            <div class="leader-item">
+                <div class="leader-head">
+                    <span><b>#{rank} {name}</b> (ID {pid})</span>
+                    <span>⏱ {onl_hours_str} в сети • 🎬 {watched_cnt} тайтл(ов)</span>
+                </div>
+                <div class="leader-bar-bg">
+                    <div class="leader-bar-fill" style="width: {max(6, pct)}%;"></div>
+                </div>
+            </div>
+            """
+
+        if not profile_cards_html:
+            profile_cards_html = '<div class="empty-state">Профили еще не добавлены. Добавь их через кнопки бота в Telegram!</div>'
+
+        history_rows_html = ""
+        for item in reversed(history[-150:]):
+            r_ts = item.get("timestamp") or item.get("ts") or now_ts
+            if isinstance(r_ts, str) and not r_ts.isdigit():
+                try:
+                    ts = int(datetime.fromisoformat(r_ts).timestamp())
+                except Exception:
+                    ts = now_ts
+            else:
+                ts = int(r_ts or now_ts)
+
+            dt_full = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M:%S")
+            p_name = item.get("name", f"ID {item.get('pid', '?')}")
+            ev_type = item.get("event", "Статус")
+            details = item.get("details", "")
+
+            ev_low = ev_type.lower()
+            if "смотр" in ev_low or "тайтл" in ev_low:
+                ev_cls = "tag-watch"
+            elif "онлайн" in ev_low or "вход" in ev_low:
+                ev_cls = "tag-onl"
+            else:
+                ev_cls = "tag-off"
+
+            history_rows_html += f"""
+            <tr class="log-row" data-search="{p_name.lower()} {ev_low} {details.lower()} {dt_full}">
+                <td class="td-time">{dt_full}</td>
+                <td><b>{p_name}</b></td>
+                <td><span class="ev-pill {ev_cls}">{ev_type}</span></td>
+                <td class="td-det">{details}</td>
+            </tr>
+            """
+
+        top_titles = sorted(title_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+        top_labels_json = json.dumps([x[0][:26] for x in top_titles], ensure_ascii=False)
+        top_vals_json = json.dumps([x[1] for x in top_titles])
+        hourly_json = json.dumps(hourly_activity)
+
+    html = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AniVox Monitor v{VERSION}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {{
+            --bg: #0b0d14;
+            --card: #151926;
+            --card-2: #1c2235;
+            --border: #283048;
+            --text: #f1f5f9;
+            --muted: #94a3b8;
+            --green: #10b981;
+            --green-glow: rgba(16, 185, 129, 0.45);
+            --purple: #a855f7;
+            --purple-glow: rgba(168, 85, 247, 0.55);
+            --grey: #64748b;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }}
+        body {{
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-size: 14.5px;
+            line-height: 1.45;
+            overflow-x: hidden;
+            padding-bottom: 36px;
+        }}
+        .wrap {{ max-width: 1080px; margin: 0 auto; padding: 10px; }}
+        .top-bar {{
+            background: linear-gradient(135deg, #171b2e 0%, #101320 100%);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 14px;
+            margin-bottom: 12px;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+        }}
+        .brand-title {{
+            font-size: clamp(17px, 4.5vw, 22px);
+            font-weight: 800;
+            background: linear-gradient(90deg, #fff, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .top-controls {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+        .pill-info {{
+            font-size: 12px;
+            color: var(--muted);
+            background: rgba(255,255,255,0.04);
+            padding: 6px 10px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+        }}
+        .btn-sm {{
+            background: var(--card-2);
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 6px 11px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }}
+        .btn-sm.active {{ background: var(--purple); border-color: var(--purple); color: #fff; }}
+        .tabs-nav {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 14px;
+        }}
+        .tab-btn {{
+            padding: 12px 10px;
+            background: var(--card);
+            color: var(--muted);
+            border: 1px solid var(--border);
+            border-radius: 13px;
+            font-size: 13.5px;
+            font-weight: 700;
+            cursor: pointer;
+            text-align: center;
+        }}
+        .tab-btn.active {{
+            background: linear-gradient(135deg, #6366f1, #a855f7);
+            color: #fff;
+            border-color: transparent;
+            box-shadow: 0 4px 16px rgba(168, 85, 247, 0.35);
+        }}
+        .tab-pane {{ display: none; }}
+        .tab-pane.active {{ display: block; }}
+        .kpi-grid {{
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-bottom: 12px;
+        }}
+        @media (min-width: 600px) {{ .kpi-grid {{ grid-template-columns: repeat(4, 1fr); }} }}
+        .kpi-card {{
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 13px;
+            padding: 11px 13px;
+            cursor: pointer;
+        }}
+        .kpi-lbl {{ font-size: 12px; color: var(--muted); }}
+        .kpi-val {{ font-size: 21px; font-weight: 800; margin-top: 2px; }}
+        .filter-row {{
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            scrollbar-width: none;
+            margin-bottom: 12px;
+        }}
+        .filter-row::-webkit-scrollbar {{ display: none; }}
+        .f-chip {{
+            background: var(--card);
+            color: var(--muted);
+            border: 1px solid var(--border);
+            padding: 7px 12px;
+            border-radius: 20px;
+            font-size: 12.5px;
+            font-weight: 600;
+            white-space: nowrap;
+            cursor: pointer;
+        }}
+        .f-chip.active {{ background: var(--text); color: var(--bg); border-color: var(--text); }}
+        .profiles-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }}
+        .prof-card {{
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 11px;
+        }}
+        .prof-card.state-watching {{ border-color: rgba(168, 85, 247, 0.55); box-shadow: 0 0 20px rgba(168, 85, 247, 0.12); }}
+        .prof-card.state-online {{ border-color: rgba(16, 185, 129, 0.45); }}
+        .prof-card.state-offline {{ opacity: 0.88; }}
+        .prof-top {{ display: flex; align-items: center; gap: 12px; }}
+        .ava-wrap {{
+            position: relative;
+            width: 60px;
+            height: 60px;
+            flex-shrink: 0;
+            border-radius: 50%;
+            padding: 3px;
+        }}
+        .ava-img {{
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            object-fit: cover;
+            display: block;
+        }}
+        .ava-dot {{
+            position: absolute;
+            bottom: 1px;
+            right: 1px;
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            border: 2.5px solid var(--card);
+        }}
+        /* СЕРАЯ АВАТАРКА (ОФФЛАЙН) */
+        .ava-wrap.state-offline {{ background: #334155; }}
+        .ava-wrap.state-offline .ava-img {{ filter: grayscale(100%) contrast(0.95) opacity(0.72); }}
+        .ava-wrap.state-offline .ava-dot {{ background: #64748b; }}
+        /* ФИОЛЕТОВАЯ АВАТАРКА (СМОТРИТ) */
+        .ava-wrap.state-watching {{ background: linear-gradient(135deg, #a855f7, #ec4899); box-shadow: 0 0 16px var(--purple-glow); }}
+        .ava-wrap.state-watching .ava-dot {{ background: #a855f7; box-shadow: 0 0 8px #a855f7; animation: pulseDot 1.6s infinite; }}
+        /* ЗЕЛЕНАЯ АВАТАРКА (ОНЛАЙН) */
+        .ava-wrap.state-online {{ background: linear-gradient(135deg, #10b981, #059669); box-shadow: 0 0 14px var(--green-glow); }}
+        .ava-wrap.state-online .ava-dot {{ background: #10b981; box-shadow: 0 0 8px #10b981; animation: pulseDot 2s infinite; }}
+        @keyframes pulseDot {{ 0%, 100% {{ transform: scale(1); }} 50% {{ transform: scale(1.22); }} }}
+        .prof-meta {{ flex: 1; min-width: 0; }}
+        .prof-name-row {{ display: flex; justify-content: space-between; align-items: center; gap: 6px; flex-wrap: wrap; }}
+        .prof-name {{ font-size: 16px; font-weight: 800; color: #fff; word-break: break-word; }}
+        .prof-sub {{ font-size: 12px; color: var(--muted); margin-top: 3px; }}
+        .status-badge {{ font-size: 11px; font-weight: 800; padding: 4px 9px; border-radius: 20px; white-space: nowrap; }}
+        .badge-watching {{ background: rgba(168, 85, 247, 0.2); color: #d8b4fe; border: 1px solid rgba(168, 85, 247, 0.45); }}
+        .badge-online {{ background: rgba(16, 185, 129, 0.18); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }}
+        .badge-offline {{ background: rgba(100, 116, 139, 0.2); color: #cbd5e1; border: 1px solid rgba(100, 116, 139, 0.35); }}
+        .watching-box {{ background: rgba(255,255,255,0.03); border-left: 3px solid var(--purple); padding: 9px 11px; border-radius: 9px; }}
+        .state-online .watching-box {{ border-left-color: var(--green); }}
+        .state-offline .watching-box {{ border-left-color: var(--grey); }}
+        .watching-lbl {{ font-size: 11px; color: var(--muted); }}
+        .watching-val {{ font-size: 13.5px; font-weight: 700; color: #f8fafc; margin-top: 2px; word-break: break-word; }}
+        .time-panel {{ background: rgba(0,0,0,0.26); border-radius: 10px; padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }}
+        .time-item {{ display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }}
+        .t-lbl {{ color: var(--muted); }}
+        .t-val {{ font-weight: 700; font-variant-numeric: tabular-nums; }}
+        .live-timer {{ color: #c084fc; }}
+        .t-muted {{ color: #94a3b8; font-weight: 500; }}
+        .box-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px; margin-bottom: 14px; }}
+        .box-title {{ font-size: 15px; font-weight: 800; margin-bottom: 11px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }}
+        .table-wrap {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+        table {{ width: 100%; border-collapse: collapse; min-width: 440px; font-size: 13px; }}
+        th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.06); }}
+        th {{ font-size: 11.5px; color: var(--muted); text-transform: uppercase; }}
+        .td-time {{ white-space: nowrap; font-variant-numeric: tabular-nums; color: #cbd5e1; font-size: 12px; }}
+        .td-det {{ word-break: break-word; }}
+        .ev-pill {{ padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; white-space: nowrap; }}
+        .tag-watch {{ background: rgba(168,85,247,0.2); color: #d8b4fe; }}
+        .tag-onl {{ background: rgba(16,185,129,0.2); color: #6ee7b7; }}
+        .tag-off {{ background: rgba(100,116,139,0.25); color: #cbd5e1; }}
+        .grid-2 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 14px; }}
+        .chart-holder {{ position: relative; height: 220px; width: 100%; }}
+        .inp {{ width: 100%; background: #0e111b; border: 1px solid var(--border); color: var(--text); padding: 10px 12px; border-radius: 10px; font-size: 14px; margin-bottom: 9px; }}
+        .leader-item {{ margin-bottom: 10px; }}
+        .leader-head {{ display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 4px; flex-wrap: wrap; }}
+        .leader-bar-bg {{ width: 100%; height: 8px; background: #0e111b; border-radius: 6px; overflow: hidden; }}
+        .leader-bar-fill {{ height: 100%; background: linear-gradient(90deg, #6366f1, #a855f7); border-radius: 6px; }}
+        .empty-state {{ padding: 24px; text-align: center; color: var(--muted); }}
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <header class="top-bar">
+        <div>
+            <div class="brand-title">⚡ AniVox Live Monitor v{VERSION}</div>
+            <div style="font-size: 12px; color: var(--muted);">⚪ Оффлайн • 🟣 Смотрит аниме • 🟢 В сети</div>
+        </div>
+        <div class="top-controls">
+            <span class="pill-info" id="syncTime">🕒 {now_str}</span>
+            <button class="btn-sm" id="soundToggleBtn" onclick="toggleSoundRadar()">🔕 Звук-радар: ВЫКЛ</button>
+        </div>
+    </header>
+
+    <div class="tabs-nav">
+        <button class="tab-btn active" onclick="openTab('tab1', this)">📡 1. Профили & Статусы</button>
+        <button class="tab-btn" onclick="openTab('tab2', this)">📊 2. Аналитика & Функции</button>
+    </div>
+
+    <div id="tab1" class="tab-pane active">
+        <div class="kpi-grid">
+            <div class="kpi-card" onclick="filterCards('all')">
+                <div class="kpi-lbl">👥 Всего профилей</div>
+                <div class="kpi-val">{len(profiles)}</div>
+            </div>
+            <div class="kpi-card" onclick="filterCards('watching')">
+                <div class="kpi-lbl">🟣 Смотрят сейчас</div>
+                <div class="kpi-val" style="color: #c084fc;">{cnt_watching}</div>
+            </div>
+            <div class="kpi-card" onclick="filterCards('online')">
+                <div class="kpi-lbl">🟢 В сети</div>
+                <div class="kpi-val" style="color: #34d399;">{cnt_online}</div>
+            </div>
+            <div class="kpi-card" onclick="filterCards('offline')">
+                <div class="kpi-lbl">⚪ Оффлайн</div>
+                <div class="kpi-val" style="color: #94a3b8;">{cnt_offline}</div>
+            </div>
+        </div>
+
+        <div class="filter-row">
+            <button class="f-chip active" onclick="filterCards('all', this)">Все ({len(profiles)})</button>
+            <button class="f-chip" onclick="filterCards('watching', this)">🟣 Смотрят ({cnt_watching})</button>
+            <button class="f-chip" onclick="filterCards('online', this)">🟢 Онлайн ({cnt_online})</button>
+            <button class="f-chip" onclick="filterCards('offline', this)">⚪ Оффлайн ({cnt_offline})</button>
+        </div>
+
+        <div class="profiles-grid" id="profilesContainer">
+            {profile_cards_html}
+        </div>
+
+        <div class="box-card">
+            <div class="box-title">
+                <span>🕒 История изменения статусов (с датой и временем)</span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Дата и Время</th>
+                            <th>Профиль</th>
+                            <th>Статус</th>
+                            <th>Подробности / Тайтл</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {history_rows_html if history_rows_html else '<tr><td colspan="4" class="empty-state">Лог событий пока пуст</td></tr>'}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div id="tab2" class="tab-pane">
+        <div class="box-card">
+            <div class="box-title">🏆 Рейтинг активности профилей</div>
+            {leaderboard_rows_html if leaderboard_rows_html else '<div class="empty-state">Недостаточно данных для рейтинга</div>'}
+        </div>
+
+        <div class="grid-2">
+            <div class="box-card" style="margin-bottom:0;">
+                <div class="box-title">📊 Почасовая активность (00:00 – 23:00)</div>
+                <div class="chart-holder"><canvas id="hourChart"></canvas></div>
+            </div>
+            <div class="box-card" style="margin-bottom:0;">
+                <div class="box-title">🎬 Популярные тайтлы</div>
+                <div class="chart-holder"><canvas id="titleChart"></canvas></div>
+            </div>
+        </div>
+
+        <div class="grid-2">
+            <div class="box-card" style="margin-bottom:0;">
+                <div class="box-title">🍿 Калькулятор марафона серий</div>
+                <input type="number" id="epCnt" class="inp" value="12" min="1" placeholder="Сколько серий осталось?" oninput="calcMarathon()">
+                <select id="epLen" class="inp" onchange="calcMarathon()">
+                    <option value="20">20 мин (без опенинга и эндинга)</option>
+                    <option value="24" selected>24 мин (полная серия)</option>
+                    <option value="45">45 мин (OVA / Спешл)</option>
+                </select>
+                <div id="marathonOut" style="background:rgba(168,85,247,0.12); border:1px solid rgba(168,85,247,0.35); padding:10px; border-radius:10px; font-size:13px;"></div>
+            </div>
+
+            <div class="box-card" style="margin-bottom:0;">
+                <div class="box-title">
+                    <span>🔍 Поиск по базе логов</span>
+                    <button class="btn-sm active" onclick="downloadCSV()">📥 Скачать CSV</button>
+                </div>
+                <input type="text" id="searchInp" class="inp" placeholder="Введи ник, тайтл, дату или статус..." oninput="filterHistoryTable()">
+                <div style="font-size:12.5px; color:var(--muted);">
+                    Найдено записей: <b id="foundCnt" style="color:#fff;">все</b>
+                </div>
+            </div>
+        </div>
+
+        <div class="box-card">
+            <div class="box-title">📋 Отфильтрованный журнал событий</div>
+            <div class="table-wrap">
+                <table id="exportTable">
+                    <thead>
+                        <tr>
+                            <th>Дата и Время</th>
+                            <th>Профиль</th>
+                            <th>Статус</th>
+                            <th>Подробности</th>
+                        </tr>
+                    </thead>
+                    <tbody id="searchTableBody">
+                        {history_rows_html if history_rows_html else '<tr><td colspan="4">Нет записей</td></tr>'}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let soundRadarEnabled = false;
+
+    function openTab(id, btn) {{
+        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+        btn.classList.add('active');
+    }}
+
+    function filterCards(state, btn) {{
+        if (btn) {{
+            document.querySelectorAll('.f-chip').forEach(c => c.classList.remove('active'));
+            btn.classList.add('active');
+        }}
+        document.querySelectorAll('#profilesContainer .prof-card').forEach(card => {{
+            const st = card.getAttribute('data-state');
+            if (state === 'all' || st === state || (state === 'online' && st === 'watching')) {{
+                card.style.display = 'flex';
+            }} else {{
+                card.style.display = 'none';
+            }}
+        }});
+    }}
+
+    function tickTimers() {{
+        const now = Math.floor(Date.now() / 1000);
+        document.querySelectorAll('.live-timer').forEach(el => {{
+            const ts = parseInt(el.getAttribute('data-ts'), 10);
+            if (!ts) return;
+            let d = Math.max(0, now - ts);
+            const days = Math.floor(d / 86400); d %= 86400;
+            const hrs = Math.floor(d / 3600); d %= 3600;
+            const mins = Math.floor(d / 60);
+            const secs = d % 60;
+            let out = [];
+            if (days > 0) out.push(days + 'д');
+            if (hrs > 0 || days > 0) out.push(hrs + 'ч');
+            out.push(mins + 'м ' + secs + 'с');
+            el.textContent = out.join(' ');
+        }});
+    }}
+    setInterval(tickTimers, 1000);
+    tickTimers();
+
+    function playBeep() {{
+        if (!soundRadarEnabled) return;
+        try {{
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(880, ctx.currentTime);
+            gain.gain.setValueAtTime(0.1, ctx.currentTime);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + 0.18);
+        }} catch (e) {{}}
+    }}
+
+    function toggleSoundRadar() {{
+        soundRadarEnabled = !soundRadarEnabled;
+        const btn = document.getElementById('soundToggleBtn');
+        btn.textContent = soundRadarEnabled ? '🔔 Звук-радар: ВКЛ' : '🔕 Звук-радар: ВЫКЛ';
+        btn.classList.toggle('active', soundRadarEnabled);
+        if (soundRadarEnabled) playBeep();
+    }}
+
+    function calcMarathon() {{
+        const eps = parseInt(document.getElementById('epCnt').value) || 0;
+        const len = parseInt(document.getElementById('epLen').value) || 24;
+        const mins = eps * len;
+        const h = Math.floor(mins / 60);
+        const m = mins % 60;
+        const end = new Date(Date.now() + mins * 60000).toLocaleTimeString('ru-RU', {{hour:'2-digit', minute:'2-digit'}});
+        document.getElementById('marathonOut').innerHTML =
+            `⏱ Непрерывный просмотр: <b>${{h}} ч ${{m}} мин</b><br>🏁 Завершишь просмотр в: <b>${{end}}</b>`;
+    }}
+    calcMarathon();
+
+    function filterHistoryTable() {{
+        const q = document.getElementById('searchInp').value.toLowerCase().trim();
+        let cnt = 0;
+        document.querySelectorAll('#searchTableBody .log-row').forEach(r => {{
+            const hay = r.getAttribute('data-search') || '';
+            if (!q || hay.includes(q)) {{
+                r.style.display = '';
+                cnt++;
+            }} else {{
+                r.style.display = 'none';
+            }}
+        }});
+        document.getElementById('foundCnt').textContent = cnt;
+    }}
+
+    function downloadCSV() {{
+        const rows = document.querySelectorAll('#exportTable tr');
+        let csv = [];
+        rows.forEach(r => {{
+            if (r.style.display === 'none') return;
+            let line = [];
+            r.querySelectorAll('th, td').forEach(c => line.push('"' + c.innerText.replace(/"/g, '""') + '"'));
+            csv.push(line.join(';'));
+        }});
+        const blob = new Blob(["\\uFEFF" + csv.join("\\n")], {{type: 'text/csv;charset=utf-8;'}});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'anivox_logs.csv';
+        a.click();
+    }}
+
+    new Chart(document.getElementById('hourChart'), {{
+        type: 'bar',
+        data: {{
+            labels: Array.from({{length:24}}, (_,i) => (i<10?'0'+i:i)+':00'),
+            datasets: [{{ data: {hourly_json}, backgroundColor: '#a855f7', borderRadius: 4 }}]
+        }},
+        options: {{
+            responsive: true, maintainAspectRatio: false,
+            plugins: {{ legend: {{ display: false }} }},
+            scales: {{
+                x: {{ ticks: {{ color: '#94a3b8', font: {{size: 10}} }} }},
+                y: {{ ticks: {{ color: '#94a3b8', stepSize: 1 }}, beginAtZero: true }}
+            }}
+        }}
+    }});
+
+    const tLabels = {top_labels_json};
+    const tVals = {top_vals_json};
+    new Chart(document.getElementById('titleChart'), {{
+        type: 'doughnut',
+        data: {{
+            labels: tLabels.length ? tLabels : ['Нет данных'],
+            datasets: [{{
+                data: tVals.length ? tVals : [1],
+                backgroundColor: ['#a855f7','#10b981','#6366f1','#ec4899','#f59e0b','#3b82f6','#14b8a6','#ef4444'],
+                borderWidth: 0
+            }}]
+        }},
+        options: {{
+            responsive: true, maintainAspectRatio: false,
+            plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#f1f5f9', font: {{size: 11}}, boxWidth: 11 }} }} }}
+        }}
+    }});
+</script>
+</body>
+</html>"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return output_path
+
+
+# ==================== ФОНОВЫЙ МОНИТОРИНГ ПРОФИЛЕЙ И ОЧИСТКА ====================
+def check_all_profiles_once(cfg, notify_even_if_same=False, target_chat=None):
+    pids = list(cfg.get("profiles", {}).keys())
+    if not pids:
+        if notify_even_if_same and target_chat:
+            tg_api(cfg["token"], "sendMessage", {"chat_id": target_chat, "text": "Список профилей пуст."})
+        return
+
+    now = int(time.time())
+
+    for pid in pids:
+        info = fetch_profile(pid)
+        if not info.get("ok"):
+            continue
+
+        with config_lock:
+            p = cfg["profiles"].get(pid, {})
+            old_onl = bool(p.get("online", False))
+            old_wat = bool(p.get("watching", False))
+            old_ttl = p.get("current_title", "Ничего не смотрит")
+
+            new_onl = bool(info.get("online", False))
+            new_wat = bool(info.get("watching", False))
+            new_ttl = info.get("current_title", "Ничего не смотрит")
+
+            p["nickname"] = info.get("nickname", p.get("nickname", f"User #{pid}"))
+            p["avatar"] = info.get("avatar", p.get("avatar", make_svg_avatar(p["nickname"])))
+
+            if new_onl:
+                p["online_seconds"] = int(p.get("online_seconds", 0)) + DEFAULT_INTERVAL
+
+            status_diff = (old_onl != new_onl) or (old_wat != new_wat) or (old_ttl != new_ttl)
+            if status_diff:
+                prev_label = f"{'Смотрел: ' + old_ttl if old_wat else ('В сети' if old_onl else 'Оффлайн')}"
+                p["prev_status"] = prev_label
+                p["online"] = new_onl
+                p["watching"] = new_wat
+                p["current_title"] = new_ttl
+                p["last_status_change"] = now
+
+                if new_wat and old_ttl != new_ttl:
+                    p["titles_watched"] = int(p.get("titles_watched", 0)) + 1
+                    ev_type = "Смотрит"
+                    details = f"Смотрит: {new_ttl}"
+                elif new_onl and not old_onl:
+                    ev_type = "Онлайн"
+                    details = "Зашел(ла) на AniVox"
+                elif not new_onl and old_onl:
+                    ev_type = "Оффлайн"
+                    details = f"Вышел(ла) из сети (был: {prev_label})"
+                else:
+                    ev_type = "Статус"
+                    details = f"Активность: {new_ttl}"
+
+                cfg["history"].append({
+                    "ts": now,
+                    "timestamp": now,
+                    "pid": pid,
+                    "name": p["nickname"],
+                    "event": ev_type,
+                    "details": details
+                })
+                if len(cfg["history"]) > 600:
+                    cfg["history"] = cfg["history"][-600:]
+
+                save_config(cfg)
+
+                for uid_str in list(cfg.get("users", {}).keys()):
+                    s = get_user_settings(cfg, uid_str)
+                    ntf = s["notify"]
+                    if ev_type == "Онлайн" and not ntf.get("onl", True):
+                        continue
+                    if ev_type == "Оффлайн" and not ntf.get("off", True):
+                        continue
+                    if ev_type == "Смотрит" and not ntf.get("ttl", True):
+                        continue
+
+                    dt_s = datetime.fromtimestamp(now).strftime("%d.%m.%Y %H:%M:%S")
+                    badge = "🟣 СМОТРИТ АНИМЕ" if new_wat else ("🟢 В СЕТИ" if new_onl else "⚪ ОФФЛАЙН")
+                    alert_text = (
+                        f"🔔 <b>Изменение статуса AniVox!</b>\n\n"
+                        f"👤 Профиль: <b>{p['nickname']}</b> (<code>#{pid}</code>)\n"
+                        f"📡 Статус: <b>{badge}</b>\n"
+                        f"🎬 Тайтл: <i>{new_ttl}</i>\n"
+                        f"🕒 Время: <code>{dt_s}</code>"
+                    )
+                    send_or_edit(cfg, uid_str, alert_text, reply_markup=kb_main_menu(cfg, uid_str))
+
+    generate_html_report(cfg)
+    if notify_even_if_same and target_chat:
+        send_or_edit(cfg, target_chat, format_status_text(cfg), reply_markup=kb_main_menu(cfg, target_chat), force_new=True)
+
+
+def monitor_loop(cfg):
+    while True:
+        try:
+            check_all_profiles_once(cfg)
+            now = time.time()
+            for uid_str, u in list(cfg.get("users", {}).items()):
+                cln_min = u.get("settings", {}).get("cleanup_min", 0)
+                if cln_min > 0:
+                    q = u.get("cleanup_queue", [])
+                    rem_q = []
+                    for item in q:
+                        if now - item["ts"] >= cln_min * 60:
+                            tg_api(cfg["token"], "deleteMessage", {"chat_id": uid_str, "message_id": item["mid"]})
+                        else:
+                            rem_q.append(item)
+                    u["cleanup_queue"] = rem_q
+        except Exception as e:
+            print(f"[Monitor Loop Error]: {e}")
+
+        intervals = [u.get("settings", {}).get("interval", DEFAULT_INTERVAL) for u in cfg.get("users", {}).values()]
+        sleep_sec = min(intervals) if intervals else DEFAULT_INTERVAL
+        time.sleep(max(1, sleep_sec))
+
+
+# ==================== ВСТРОЕННЫЙ ВЕБ-СЕРВЕР + AUTOPING ДЛЯ RENDER ====================
+class DashboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        cfg = load_config()
+        if self.path.startswith("/api/status"):
+            payload = json.dumps(build_api_payload(cfg), ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if self.path.startswith("/ping"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+
+        path = generate_html_report(cfg)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(str(e).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_web_server():
+    server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
+    print(f"[Web] Дашборд запущен на http://0.0.0.0:{PORT}")
+    server.serve_forever()
+
+
+def autoping_loop(cfg):
+    while True:
+        time.sleep(240)
+        url = cfg.get("autoping_url", "").strip()
+        if url:
+            ping_target = url.rstrip("/") + "/ping"
+            try:
+                req = urllib.request.Request(ping_target, headers={"User-Agent": USER_AGENT})
+                urllib.request.urlopen(req, timeout=10).read()
+            except Exception:
+                pass
+
+
+# ==================== ТОЧКА ВХОДА (LONG POLLING + ПОТОКИ) ====================
+def main():
+    cfg = load_config()
+    generate_html_report(cfg)
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+    threading.Thread(target=monitor_loop, args=(cfg,), daemon=True).start()
+    threading.Thread(target=autoping_loop, args=(cfg,), daemon=True).start()
+
+    print(f"[{APP_NAME} v{VERSION}] Запущен! Ожидание событий Telegram...")
+    offset = 0
+    while True:
+        try:
+            cfg = load_config()
+            token = cfg.get("token", "")
+            if not token or token == "ВСТАВЬ_ТОКЕН_БОТА":
+                time.sleep(5)
+                continue
+
+            res = tg_api(token, "getUpdates", {
+                "offset": offset,
+                "timeout": 25,
+                "allowed_updates": ["message", "callback_query"]
+            })
+            if res.get("ok"):
+                for upd in res.get("result", []):
+                    offset = upd["update_id"] + 1
+                    handle_update(cfg, upd)
+            else:
+                time.sleep(3)
+        except KeyboardInterrupt:
+            print("\nОстановка бота...")
+            break
+        except Exception as e:
+            print(f"[Polling Error]: {e}")
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
