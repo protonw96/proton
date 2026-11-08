@@ -1386,12 +1386,7 @@ class Monitor:
             hourly_bins = [0] * 24
             title_counter: Dict[str, int] = {}
             genre_counter: Dict[str, int] = {}
-
-            for c_item in self.store.anime_cache.values():
-                for g in c_item.get("genres", []):
-                    genre_counter[g] = genre_counter.get(g, 0) + 1
-
-                    for h in history:
+        for h in history:
             raw_ts = h.get("timestamp") or h.get("ts") or 0
             if isinstance(raw_ts, str) and not raw_ts.isdigit():
                 try:
@@ -1409,6 +1404,7 @@ class Monitor:
                 t_name = det.split("Смотрит:", 1)[1].strip()
                 if t_name and t_name != "Ничего не смотрит":
                     title_counts[t_name] = title_counts.get(t_name, 0) + 1
+
 
         profile_cards_html = ""
         leaderboard_rows_html = ""
