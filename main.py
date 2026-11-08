@@ -27,7 +27,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ==================== ГЛОБАЛЬНЫЕ КОНСТАНТЫ ====================
 APP_NAME = "AniVox Monitor"
 VERSION = "5.5.0"
-CONFIG_PATH = os.environ.get("ANIVOX_CONFIG", "anivox_config.json")
+CONFIG_PATH = os.environ.get("ANIVOX_MONITOR", "anivox_monitor.json")
 PORT = int(os.environ.get("PORT", 8080))
 DEFAULT_INTERVAL = 5
 PROFILE_RE = re.compile(r"(?:anivox\.(?:fun|ru|org)/profile/|id=|^)(\d+)", re.IGNORECASE)
