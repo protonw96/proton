@@ -33,7 +33,16 @@ CONFIG_PATH = os.environ.get("ANIVOX_STATE_FILE", "anivox_monitor.json")
 REPORT_PATH = os.environ.get("ANIVOX_REPORT_FILE", "anivox_report.html")
 LOG_PATH = os.environ.get("ANIVOX_LOG_FILE", "anivox_monitor.log")
 KODIK_TOKEN = os.environ.get("KODIK_TOKEN", "")
-PORT = int(os.environ.get("PORT", 8080))
+try:
+    PORT = int(os.environ.get("PORT", "8080"))
+except (TypeError, ValueError):
+    PORT = 8080
+
+# Render may use a nested path for a persistent disk or log file.
+for _path in (CONFIG_PATH, REPORT_PATH, LOG_PATH):
+    _parent = os.path.dirname(os.path.abspath(_path))
+    if _parent:
+        os.makedirs(_parent, exist_ok=True)
 
 DEFAULT_INTERVAL = 5  # сек
 PROFILE_RE = re.compile(r"(?:anivox\.(?:fun|ru|org)/(?:profile|users?)/|id=|^)(\d+)", re.IGNORECASE)
@@ -138,6 +147,23 @@ class Settings:
     min_request_gap_seconds: float = 0.5
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """Convert legacy/untrusted JSON values to int without crashing startup."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    """Convert legacy/untrusted JSON values to float without crashing startup."""
+    try:
+        result = float(value)
+        return result if result == result and abs(result) != float("inf") else float(default)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+
+
 # ==================== ХРАНИЛИЩЕ ANIVOX_MONITOR.JSON ====================
 class Store:
     def __init__(self, path: str = CONFIG_PATH):
@@ -169,6 +195,10 @@ class Store:
                 logger.error(f"Ошибка чтения {self.path}: {e}")
                 return
 
+            if not isinstance(raw, dict):
+                logger.error("Корень JSON должен быть объектом; файл состояния не загружен.")
+                return
+
             self.token = raw.get("token") or self.token
             self.chat_id = str(raw.get("chat_id") or self.chat_id or "")
             self.autoping_url = raw.get("autoping_url") or self.autoping_url
@@ -180,20 +210,65 @@ class Store:
             elif isinstance(raw_allowed, dict):
                 self.allowed_users = {str(k): str(v) for k, v in raw_allowed.items()}
 
-            self.anime_cache = raw.get("anime_cache", {})
-            self.anime_subs = raw.get("anime_subs", [])
-            self.wall_messages = raw.get("wall_messages", [])
-            self.online_snipers = raw.get("online_snipers", {})
-            self.user_settings = raw.get("user_settings") or raw.get("users") or {}
+            # Старые/поврежденные версии JSON могли сохранять коллекции
+            # не тем типом (например, history как dict). Нормализуем их
+            # до ожидаемых типов, чтобы приложение не падало при старте.
+            def as_dict(value):
+                return value if isinstance(value, dict) else {}
+
+            def as_list(value):
+                if isinstance(value, list):
+                    return value
+                if isinstance(value, dict):
+                    # Сохраняем содержимое старого словаря, если оно есть.
+                    return list(value.values())
+                return []
+
+            self.anime_cache = as_dict(raw.get("anime_cache", {}))
+            self.anime_subs = as_list(raw.get("anime_subs", []))
+            self.wall_messages = as_list(raw.get("wall_messages", []))
+            self.online_snipers = as_dict(raw.get("online_snipers", {}))
+            self.user_settings = as_dict(raw.get("user_settings") or raw.get("users") or {})
 
             # Настройки
             s_raw = raw.get("settings", {})
             if isinstance(s_raw, dict):
                 for k, v in s_raw.items():
                     if hasattr(self.settings, k):
-                        setattr(self.settings, k, v)
+                        try:
+                            setattr(self.settings, k, v)
+                        except (TypeError, ValueError):
+                            logger.warning("Некорректная настройка %s пропущена", k)
                 if "interval_seconds" not in s_raw and "interval_minutes" in s_raw:
-                    self.settings.interval_seconds = max(1, int(float(s_raw["interval_minutes"]) * 60))
+                    self.settings.interval_seconds = max(1, _coerce_int(_coerce_float(s_raw["interval_minutes"], 1 / 12) * 60, 5))
+                # Normalize every setting so malformed legacy JSON cannot kill a worker.
+                defaults = Settings()
+                integer_limits = {
+                    "interval_seconds": (1, 3600),
+                    "auto_cleanup_minutes": (0, 10080),
+                    "auto_cleanup_days": (1, 3650),
+                    "request_timeout": (2, 120),
+                }
+                float_limits = {
+                    "interval_minutes": (1 / 60, 60.0),
+                    "silent_until": (0.0, 4102444800.0),
+                    "min_request_gap_seconds": (0.0, 60.0),
+                }
+                boolean_fields = {
+                    "notify_on_change", "online", "offline", "title", "errors",
+                    "edit_mode", "silent_no_sound",
+                }
+                for field_name, (low, high) in integer_limits.items():
+                    current = getattr(self.settings, field_name)
+                    setattr(self.settings, field_name, max(low, min(high, _coerce_int(current, getattr(defaults, field_name)))))
+                for field_name, (low, high) in float_limits.items():
+                    current = getattr(self.settings, field_name)
+                    setattr(self.settings, field_name, max(low, min(high, _coerce_float(current, getattr(defaults, field_name)))))
+                for field_name in boolean_fields:
+                    current = getattr(self.settings, field_name)
+                    if isinstance(current, str):
+                        current = current.strip().lower() in {"1", "true", "yes", "on", "да"}
+                    setattr(self.settings, field_name, bool(current))
 
             # Профили
             self.profiles = {}
@@ -225,22 +300,55 @@ class Store:
                     profile_id=pid_str,
                     label=pdata.get("label") or last_st.get("nickname") or f"ID {pid_str}",
                     avatar=pdata.get("avatar") or last_st.get("avatar") or "",
-                    last_signature=pdata.get("last_signature", ""),
-                    last_check=pdata.get("last_check", ""),
+                    last_signature=str(pdata.get("last_signature") or ""),
+                    last_check=str(pdata.get("last_check") or ""),
                     last_ok=bool(pdata.get("last_ok", True)),
-                    last_error=pdata.get("last_error", ""),
+                    last_error=str(pdata.get("last_error") or ""),
                     last_status=last_st,
-                    last_status_change_ts=int(pdata.get("last_status_change_ts") or last_st.get("last_seen_timestamp") or time.time()),
+                    last_status_change_ts=_coerce_int(pdata.get("last_status_change_ts") or last_st.get("last_seen_timestamp"), int(time.time())),
                     prev_status_text=prev_status_text,
-                    online_seconds=int(pdata.get("online_seconds", 0)),
-                    watching_seconds=int(pdata.get("watching_seconds", 0)),
-                    titles_count=int(pdata.get("titles_count", 0))
+                    online_seconds=_coerce_int(pdata.get("online_seconds", 0), 0),
+                    watching_seconds=_coerce_int(pdata.get("watching_seconds", 0), 0),
+                    titles_count=_coerce_int(pdata.get("titles_count", 0), 0)
                 )
 
-            self.history = raw.get("history", [])
+            self.history = [x for x in as_list(raw.get("history", [])) if isinstance(x, dict)]
+            self.wall_messages = [x for x in self.wall_messages if isinstance(x, dict)]
+            self.anime_subs = [x for x in self.anime_subs if isinstance(x, dict)]
 
     def save(self):
         with self.lock:
+            # Force normalization before slicing: legacy JSON may contain dicts,
+            # tuples or mixed scalar/list values from older releases.
+            if isinstance(self.history, dict):
+                self.history = list(self.history.values())
+            elif not isinstance(self.history, list):
+                self.history = []
+            self.history = [x for x in self.history if isinstance(x, dict)][-1000:]
+
+            if isinstance(self.wall_messages, dict):
+                self.wall_messages = list(self.wall_messages.values())
+            elif not isinstance(self.wall_messages, list):
+                self.wall_messages = []
+            self.wall_messages = [x for x in self.wall_messages if isinstance(x, dict)][-100:]
+
+            if isinstance(self.anime_subs, dict):
+                self.anime_subs = list(self.anime_subs.values())
+            elif not isinstance(self.anime_subs, list):
+                self.anime_subs = []
+            self.anime_subs = [x for x in self.anime_subs if isinstance(x, dict)]
+
+            if not isinstance(self.profiles, dict):
+                self.profiles = {}
+            if not isinstance(self.allowed_users, dict):
+                self.allowed_users = {}
+            if not isinstance(self.anime_cache, dict):
+                self.anime_cache = {}
+            if not isinstance(self.online_snipers, dict):
+                self.online_snipers = {}
+            if not isinstance(self.user_settings, dict):
+                self.user_settings = {}
+
             data = {
                 "token": self.token,
                 "chat_id": self.chat_id,
@@ -271,7 +379,10 @@ class Store:
             u.setdefault("cleanup_min", self.settings.auto_cleanup_minutes)
             u.setdefault("silent_until", self.settings.silent_until)
             u.setdefault("silent_no_sound", self.settings.silent_no_sound)
-            ntf = u.setdefault("notify", {})
+            ntf = u.get("notify")
+            if not isinstance(ntf, dict):
+                ntf = {}
+                u["notify"] = ntf
             ntf.setdefault("onl", self.settings.online)
             ntf.setdefault("off", self.settings.offline)
             ntf.setdefault("ttl", self.settings.title)
@@ -679,12 +790,18 @@ class Monitor:
         now = time.time()
         changed = False
         for uid_s, ucfg in list(self.store.user_settings.items()):
-            cln_min = int(ucfg.get("cleanup_min", 0))
+            if not isinstance(ucfg, dict):
+                continue
+            cln_min = _coerce_int(ucfg.get("cleanup_min", 0), 0)
             if cln_min <= 0:
                 continue
             q = ucfg.get("msg_queue", [])
+            if not isinstance(q, list):
+                q = []
             keep = []
             for item in q:
+                if not isinstance(item, dict):
+                    continue
                 if now - float(item.get("ts", now)) >= cln_min * 60:
                     self.tg.delete_message(uid_s, int(item["mid"]))
                     changed = True
@@ -2320,6 +2437,7 @@ ACTIVE_MONITOR = None
 SERVER_INSTANCE = None
 SHUTDOWN_EVENT = threading.Event()
 REPORT_LOCK = threading.RLock()
+WEB_SERVER_READY = threading.Event()
 
 
 def _safe_text(value: Any, limit: int = 500) -> str:
@@ -3205,15 +3323,23 @@ class SecureDashboardHandler(BaseHTTPRequestHandler):
 def run_web_server() -> None:
     """Start a threaded HTTP server; each browser request gets its own thread."""
     global SERVER_INSTANCE
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), SecureDashboardHandler)
-    server.daemon_threads = True
-    SERVER_INSTANCE = server
-    logger.info("Веб-панель запущена: http://0.0.0.0:%s", PORT)
+    server = None
+    WEB_SERVER_READY.clear()
     try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), SecureDashboardHandler)
+        server.daemon_threads = True
+        SERVER_INSTANCE = server
+        WEB_SERVER_READY.set()
+        logger.info("Веб-панель запущена на 0.0.0.0:%s", PORT)
         server.serve_forever(poll_interval=0.5)
+    except OSError:
+        logger.exception("Не удалось запустить HTTP-сервер на порту %s", PORT)
+        raise
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
         SERVER_INSTANCE = None
+        WEB_SERVER_READY.clear()
 
 
 def monitor_worker(monitor: Monitor) -> None:
@@ -3320,6 +3446,10 @@ def main() -> None:
     validate_runtime()
     SHUTDOWN_EVENT.clear()
 
+    # Make all configured paths writable/available before first state save.
+    for configured_path in (CONFIG_PATH, REPORT_PATH, LOG_PATH):
+        os.makedirs(os.path.dirname(os.path.abspath(configured_path)) or ".", exist_ok=True)
+
     store = Store(CONFIG_PATH)
     env_token = os.environ.get("BOT_TOKEN", "").strip()
     if env_token:
@@ -3355,6 +3485,8 @@ def main() -> None:
         logger.info("Для панели включена защита DASHBOARD_KEY.")
 
     try:
+        if not WEB_SERVER_READY.wait(timeout=15):
+            raise RuntimeError("HTTP-сервер не смог запуститься. Проверьте PORT и логи Render.")
         while not SHUTDOWN_EVENT.wait(1):
             if not any(worker.is_alive() for worker in workers):
                 logger.error("Все рабочие потоки завершились")
@@ -3572,9 +3704,12 @@ def restore_state_backup(store: Store, backup_path: str) -> bool:
                 continue
             profile_id = str(pdata.get("profile_id") or pid)
             allowed = {field.name for field in __import__("dataclasses").fields(Profile)}
-            profiles[profile_id] = Profile(**{
-                key: value for key, value in pdata.items() if key in allowed
-            })
+            profile_data = {key: value for key, value in pdata.items() if key in allowed}
+            if not isinstance(profile_data.get("last_status"), dict):
+                profile_data["last_status"] = {}
+            profile_data.setdefault("url", f"https://anivox.fun/profile/{profile_id}")
+            profile_data["profile_id"] = profile_id
+            profiles[profile_id] = Profile(**profile_data)
         store.profiles = profiles
         store.allowed_users = dict(state.get("allowed_users") or {})
         store.anime_cache = dict(state.get("anime_cache") or {})
@@ -3606,6 +3741,35 @@ def run_self_tests() -> Dict[str, Any]:
     tests.append(("url validation", validate_profile_url("https://anivox.fun/profile/1")))
     tests.append(("reject external url", not validate_profile_url("https://example.com/")))
     tests.append(("history pruning", len(prune_history([{"i": x} for x in range(20)], 5)) == 5))
+
+    # Regression test for the exact Render crashes reported by the user:
+    # legacy last_status stored as a string and history stored as a dict.
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        state_path = os.path.join(temp_dir, "legacy.json")
+        legacy_state = {
+            "profiles": {"123": {"profile_id": "123", "last_status": "Онлайн", "online_seconds": "broken"}},
+            "history": {"old-1": {"timestamp": 1, "event": "legacy"}},
+            "wall_messages": {"old-2": {"text": "legacy"}},
+            "anime_subs": {"old-3": {"id": "3"}},
+            "settings": {"interval_seconds": "broken", "request_timeout": None},
+        }
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump(legacy_state, handle, ensure_ascii=False)
+        legacy_store = Store(state_path)
+        loaded_ok = (
+            isinstance(legacy_store.history, list)
+            and len(legacy_store.history) == 1
+            and legacy_store.profiles["123"].prev_status_text == "Онлайн"
+            and legacy_store.settings.interval_seconds >= 1
+        )
+        tests.append(("Render legacy JSON migration", loaded_ok))
+        legacy_store.history = {"broken": {"timestamp": 2}}
+        legacy_store.save()
+        with open(state_path, "r", encoding="utf-8") as handle:
+            saved_state = json.load(handle)
+        tests.append(("save normalizes dict history", isinstance(saved_state.get("history"), list)))
+
     failed = [name for name, passed in tests if not passed]
     return {"passed": len(tests) - len(failed), "total": len(tests), "failed": failed}
 
