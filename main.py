@@ -38,13 +38,13 @@ import traceback
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta8
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==================== ГЛОБАЛЬНЫЕ КОНСТАНТЫ И НАСТРОЙКИ ====================
 APP_NAME = "AniVox Monitor Ultimate"
-VERSION = "7.0.0"
-CONFIG_PATH = os.environ.get("ANIVOX_CONFIG", "anivox_config.json")
+VERSION = "7.0.1"
+CONFIG_PATH = os.environ.get("ANIVOX_CONFIG", "anivox_monitor.json")
 PORT = int(os.environ.get("PORT", 8080))
 DEFAULT_INTERVAL = 5
 START_TIME = int(time.time())
